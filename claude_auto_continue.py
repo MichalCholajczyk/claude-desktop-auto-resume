@@ -1,12 +1,14 @@
 # -*- coding: utf-8 -*-
 """
-Claude Auto-Continue — auto-wznawianie sesji Claude Desktop (Windows 11).
+Claude Auto-Resume — auto-continue for Claude Desktop (Windows 11).
 
-Monitoruje okno aplikacji Claude przez UI Automation, wykrywa komunikat
-o wyczerpaniu limitu (5h / tygodniowego), parsuje godzinę resetu i minutę
-po resecie wpisuje "continue" w pole czatu i wciska Enter.
+Watches the Claude app window via UI Automation, detects the usage-limit
+message (5-hour / weekly), parses the reset time and, one minute after the
+reset, types "continue" into the chat box and presses Enter.
 
-Wymaga: Python 3.10+, pakiet `uiautomation` (pip install uiautomation).
+UI is bilingual (English / Polish), default English.
+
+Requires: Python 3.10+, package `uiautomation` (pip install uiautomation).
 """
 
 import ctypes
@@ -27,8 +29,8 @@ try:
 except ImportError:
     ctypes.windll.user32.MessageBoxW(
         0,
-        "Brak pakietu 'uiautomation'.\n\nZainstaluj:  py -m pip install uiautomation",
-        "Claude Auto-Continue", 0x10)
+        "Missing package 'uiautomation'.\n\nInstall it:  py -m pip install uiautomation",
+        "Claude Auto-Resume", 0x10)
     sys.exit(1)
 
 APP_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -38,17 +40,18 @@ LOG_PATH = os.path.join(APP_DIR, "auto_continue.log")
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-# ---------------------------------------------------------------- konfiguracja
+# ---------------------------------------------------------------- configuration
 
 DEFAULT_CONFIG = {
-    "scan_interval_s": 20,          # co ile sekund skanować okno
-    "send_delay_after_reset_s": 60, # ile sekund po resecie wysłać "continue"
-    "message": "continue",          # co wpisać w czat
-    "auto_send": True,              # False = tylko alarmuj, nie wysyłaj
-    "keep_awake": True,             # nie pozwól Windowsowi zasnąć
-    "max_retries": 6,               # ile razy ponawiać, jeśli limit dalej aktywny
-    "retry_wait_s": 600,            # odstęp między ponowieniami bez znanej godziny resetu
-    # dodatkowe wzorce (regex, case-insensitive) traktowane jako "limit strzelony"
+    "language": "en",               # "en" or "pl"
+    "scan_interval_s": 20,          # how often to scan the window (seconds)
+    "send_delay_after_reset_s": 60, # seconds after reset to send "continue"
+    "message": "continue",          # what to type into the chat
+    "auto_send": True,              # False = only alert, do not send
+    "keep_awake": True,             # keep Windows from sleeping
+    "max_retries": 6,               # retries while the limit is still active
+    "retry_wait_s": 600,            # retry spacing when reset time is unknown
+    # extra regex patterns (case-insensitive) treated as "limit hit"
     "extra_hard_patterns": [],
 }
 
@@ -60,6 +63,8 @@ def load_config():
             cfg.update(json.load(f))
     except (OSError, ValueError):
         pass
+    if cfg.get("language") not in ("en", "pl"):
+        cfg["language"] = "en"
     return cfg
 
 
@@ -70,9 +75,152 @@ def save_config(cfg):
     except OSError:
         pass
 
-# ------------------------------------------------------------------- detekcja
+# ----------------------------------------------------------------- translations
 
-# Frazy oznaczające TWARDY limit (sesja zablokowana) — nie zwykłe ostrzeżenie.
+STRINGS = {
+    "en": {
+        # window states
+        "state_idle": "Watch is off",
+        "state_monitoring": "Watching your session",
+        "state_armed": "Limit hit — waiting for reset",
+        "state_verify": "Sent — checking result",
+        # header captions
+        "cap_click_start": "Click “Start watching”.",
+        "cap_no_window": "Can’t see the Claude window — open the app and click “Refresh”.",
+        "cap_guarding": "Guarding session: {session}",
+        "cap_scanning": "Scanning the Claude window every {sec} s.",
+        "cap_armed_reset": "Reset {reset} — I’ll send “continue” at {send}.",
+        "cap_armed_noreset": "Reset time unknown — I’ll try at {send}.",
+        "cap_verify": "About to check whether the session resumed.",
+        # usage row
+        "usage_model_none": "model limit —",
+        "usage_plan_none": "plan —",
+        "usage_model": "model limit {pct}%",
+        "usage_plan": "plan {pct}%",
+        "usage_reset_seen": "announced reset: {reset}",
+        # section headers
+        "sec_control": "CONTROL",
+        "sec_log": "LOG",
+        # controls
+        "lbl_window": "Claude window:",
+        "btn_refresh": "Refresh",
+        "btn_start": "Start watching",
+        "btn_stop": "Stop",
+        "btn_send_now": "Send “continue” now",
+        "lbl_scan_every": "Scan every",
+        "lbl_seconds": "s",
+        "chk_autosend": "Send automatically",
+        "chk_awake": "Keep the PC awake",
+        "lbl_know_reset": "Know the reset time?",
+        "btn_arm": "Arm",
+        "lbl_arm_hint": "format HH:MM — I’ll send a minute after that time",
+        "combo_handle": "{title}  (handle {hwnd})",
+        # dialogs
+        "dlg_send_title": "Confirm send",
+        "dlg_send_body": "Type “continue” and press Enter in the Claude window now?",
+        "dlg_time_title": "Invalid time",
+        "dlg_time_format": "Enter the reset time as HH:MM, e.g. 15:00.",
+        "dlg_time_range": "Time must be between 00:00 and 23:59.",
+        # log lines
+        "log_monitor_error": "Monitor ERROR: {err}",
+        "log_no_window_start": "Claude window not found — open Claude and click Refresh.",
+        "log_started": "Watching started.",
+        "log_stopped": "Watching stopped.",
+        "log_manual_send": "Manual “continue” send…",
+        "log_armed_manual": "Armed manually: reset {reset}, send at {send}.",
+        "log_autosend_off": "Send time passed, but auto-send is OFF — alert only.",
+        "log_window_refound": "Claude window found again (handle {hwnd}).",
+        "log_banner_gone": "Limit message vanished before reset — disarming, back to watching.",
+        "log_limit_detected": "LIMIT DETECTED ({hard}). Reset: {reset}. I’ll send “continue” at {send}.",
+        "log_reset_updated": "Reset time updated: {reset}.",
+        "log_limit_no_time": "LIMIT DETECTED ({hard}), but reset time is unreadable. I’ll try at {send} and keep retrying.",
+        "log_send_fail_nowin": "SEND FAILED: no Claude window.",
+        "log_send_abort_fg": "SEND ABORTED: Claude window isn’t in front (won’t type into another app).",
+        "log_sent": "Sent “{message}” + Enter.",
+        "log_send_fail": "SEND FAILED: {err}",
+        "log_retries_done": "Out of retries — back to normal watching.",
+        "log_retry_at": "Retry at {send} ({n}/{max}).",
+        "log_still_done": "Limit still active, out of retries — keep watching.",
+        "log_still_new": "Limit still active — new reset {reset}, send at {send}.",
+        "log_still_retry": "Limit still active — retry at {send} ({n}/{max}).",
+        "log_success": "SUCCESS — limit cleared, session resumed. Watching on.",
+    },
+    "pl": {
+        "state_idle": "Czuwanie wyłączone",
+        "state_monitoring": "Czuwam nad sesją",
+        "state_armed": "Limit strzelony — czekam na reset",
+        "state_verify": "Wysłano — sprawdzam efekt",
+        "cap_click_start": "Kliknij „Rozpocznij czuwanie”.",
+        "cap_no_window": "Nie widzę okna Claude — uruchom aplikację i kliknij „Odśwież”.",
+        "cap_guarding": "Pilnuję sesji: {session}",
+        "cap_scanning": "Skanuję okno Claude co {sec} s.",
+        "cap_armed_reset": "Reset {reset} — wyślę „continue” o {send}.",
+        "cap_armed_noreset": "Nie znam godziny resetu — spróbuję o {send}.",
+        "cap_verify": "Za chwilę sprawdzę, czy sesja ruszyła.",
+        "usage_model_none": "limit modelu —",
+        "usage_plan_none": "plan —",
+        "usage_model": "limit modelu {pct}%",
+        "usage_plan": "plan {pct}%",
+        "usage_reset_seen": "zapowiedziany reset: {reset}",
+        "sec_control": "STEROWANIE",
+        "sec_log": "DZIENNIK",
+        "lbl_window": "Okno Claude:",
+        "btn_refresh": "Odśwież",
+        "btn_start": "Rozpocznij czuwanie",
+        "btn_stop": "Zatrzymaj",
+        "btn_send_now": "Wyślij „continue” teraz",
+        "lbl_scan_every": "Skanuj co",
+        "lbl_seconds": "s",
+        "chk_autosend": "Wysyłaj automatycznie",
+        "chk_awake": "Nie usypiaj komputera",
+        "lbl_know_reset": "Znasz godzinę resetu?",
+        "btn_arm": "Uzbrój",
+        "lbl_arm_hint": "format HH:MM — wyślę minutę po tej godzinie",
+        "combo_handle": "{title}  (uchwyt {hwnd})",
+        "dlg_send_title": "Potwierdź wysyłkę",
+        "dlg_send_body": "Wpisać „continue” i wcisnąć Enter w oknie Claude teraz?",
+        "dlg_time_title": "Nieprawidłowa godzina",
+        "dlg_time_format": "Wpisz godzinę resetu w formacie HH:MM, np. 15:00.",
+        "dlg_time_range": "Godzina musi być z zakresu 00:00–23:59.",
+        "log_monitor_error": "BŁĄD monitora: {err}",
+        "log_no_window_start": "Nie znaleziono okna Claude — uruchom Claude i kliknij Odśwież.",
+        "log_started": "Czuwanie uruchomione.",
+        "log_stopped": "Czuwanie zatrzymane.",
+        "log_manual_send": "Ręczna wysyłka „continue”…",
+        "log_armed_manual": "Uzbrojono ręcznie: reset {reset}, wysyłka {send}.",
+        "log_autosend_off": "Czas wysyłki minął, ale auto-wysyłka jest WYŁĄCZONA — tylko alarm.",
+        "log_window_refound": "Okno Claude odnalezione ponownie (uchwyt {hwnd}).",
+        "log_banner_gone": "Komunikat o limicie zniknął przed resetem — rozbrajam i wracam do czuwania.",
+        "log_limit_detected": "LIMIT WYKRYTY ({hard}). Reset: {reset}. Wyślę „continue” o {send}.",
+        "log_reset_updated": "Zaktualizowano czas resetu: {reset}.",
+        "log_limit_no_time": "LIMIT WYKRYTY ({hard}), ale nie umiem odczytać godziny resetu. Spróbuję o {send} i będę ponawiać.",
+        "log_send_fail_nowin": "WYSYŁKA NIEUDANA: brak okna Claude.",
+        "log_send_abort_fg": "WYSYŁKA PRZERWANA: okno Claude nie jest na wierzchu (nie będę pisać do innej aplikacji).",
+        "log_sent": "Wysłano „{message}” + Enter.",
+        "log_send_fail": "WYSYŁKA NIEUDANA: {err}",
+        "log_retries_done": "Wyczerpano próby — wracam do zwykłego czuwania.",
+        "log_retry_at": "Ponowna próba o {send} ({n}/{max}).",
+        "log_still_done": "Limit nadal aktywny, wyczerpano próby — czuwam dalej.",
+        "log_still_new": "Limit nadal aktywny — nowy reset {reset}, wysyłka o {send}.",
+        "log_still_retry": "Limit nadal aktywny — ponowię o {send} ({n}/{max}).",
+        "log_success": "SUKCES — limit zniknął, sesja wznowiona. Czuwam dalej.",
+    },
+}
+
+
+def tr(lang, key, **kw):
+    """Translate a key; fall back to English, then to the raw key."""
+    template = STRINGS.get(lang, STRINGS["en"]).get(key)
+    if template is None:
+        template = STRINGS["en"].get(key, key)
+    try:
+        return template.format(**kw)
+    except (KeyError, IndexError, ValueError):
+        return template
+
+# ------------------------------------------------------------------- detection
+
+# Phrases marking a HARD limit (session blocked) — not a mere warning.
 HARD_LIMIT_PATTERNS = [
     r"you'?ve\s+reached\s+your",
     r"limit\s+reached",
@@ -112,18 +260,18 @@ MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "sty": 1, "lut": 2, "kwi": 4, "maj": 5, "cze": 6,
           "lip": 7, "sie": 8, "wrz": 9, "paź": 10, "lis": 11, "gru": 12}
 
-# Grupy UI, których treść ignorujemy (żeby rozmowa o "limitach" nie robiła fałszywych alarmów)
+# UI groups whose contents we ignore (so chatting *about* limits won't false-trigger)
 EXCLUDED_GROUPS = {"chat messages", "sidebar", "recents"}
 
 
 def parse_reset_time(text, now=None):
-    """Zwraca datetime resetu wyciągnięty z tekstu albo None."""
+    """Return the reset datetime extracted from text, or None."""
     now = now or dt.datetime.now()
 
     m = RE_RESET_ABS.search(text)
     if m:
         mon, day, hh, mm, ampm = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-        # odrzuć dopasowania bez minut/AM-PM/daty (np. "resets 5" z przypadkowego tekstu)
+        # reject matches without minutes/AM-PM/date (e.g. a stray "resets 5")
         if mm is not None or ampm or mon:
             h = int(hh)
             minute = int(mm) if mm is not None else 0
@@ -161,7 +309,7 @@ def parse_reset_time(text, now=None):
 
 
 def find_hard_limit(text, extra_patterns=()):
-    """Zwraca dopasowaną frazę twardego limitu albo None."""
+    """Return the matched hard-limit phrase, or None."""
     for pat in list(HARD_LIMIT_PATTERNS) + list(extra_patterns):
         try:
             m = re.search(pat, text, re.IGNORECASE)
@@ -171,7 +319,7 @@ def find_hard_limit(text, extra_patterns=()):
             return m.group(0)
     return None
 
-# ------------------------------------------------------------ warstwa Windows
+# -------------------------------------------------------------- Windows layer
 
 ES_CONTINUOUS = 0x80000000
 ES_SYSTEM_REQUIRED = 0x00000001
@@ -179,7 +327,7 @@ ES_DISPLAY_REQUIRED = 0x00000002
 
 
 def keep_awake(armed):
-    """Nie pozwól systemowi zasnąć; gdy uzbrojony — trzymaj też ekran."""
+    """Keep the system awake; when armed, keep the display on too."""
     flags = ES_CONTINUOUS | ES_SYSTEM_REQUIRED
     if armed:
         flags |= ES_DISPLAY_REQUIRED
@@ -204,18 +352,18 @@ def process_exe_name(pid):
     finally:
         kernel32.CloseHandle(h)
 
-# --------------------------------------------------------------- wątek monitora
+# --------------------------------------------------------------- monitor thread
 
 
 class MonitorWorker(threading.Thread):
-    """Cała komunikacja z UI Automation odbywa się w tym wątku (COM apartment)."""
+    """All UI Automation calls happen in this thread (its own COM apartment)."""
 
     IDLE, MONITORING, ARMED, VERIFY = "IDLE", "MONITORING", "ARMED", "VERIFY"
 
     def __init__(self, out_queue, cfg):
         super().__init__(daemon=True)
-        self.out = out_queue          # (typ, dane) -> UI
-        self.cmds = queue.Queue()     # komendy z UI
+        self.out = out_queue          # (kind, data) -> UI
+        self.cmds = queue.Queue()     # commands from UI
         self.cfg = cfg
         self.state = self.IDLE
         self.hwnd = None
@@ -227,27 +375,31 @@ class MonitorWorker(threading.Thread):
         self.miss_count = 0
         self._stop = threading.Event()
 
-    # --- API dla wątku UI (thread-safe) ---
+    # --- API for the UI thread (thread-safe) ---
     def command(self, name, payload=None):
         self.cmds.put((name, payload))
 
     def shutdown(self):
         self._stop.set()
 
-    # --- komunikaty do UI ---
+    # --- messages to the UI ---
     def emit(self, kind, data=None):
         self.out.put((kind, data))
 
-    def log(self, msg):
+    def t(self, key, **kw):
+        return tr(self.cfg.get("language", "en"), key, **kw)
+
+    def log(self, key, level="info", **kw):
+        msg = self.t(key, **kw)
         line = f"[{dt.datetime.now():%Y-%m-%d %H:%M:%S}] {msg}"
-        self.emit("log", line)
+        self.emit("log", (line, level))
         try:
             with open(LOG_PATH, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
         except OSError:
             pass
 
-    # ------------------------------------------------------------- pętla główna
+    # ------------------------------------------------------------- main loop
     def run(self):
         with auto.UIAutomationInitializerInThread():
             auto.SetGlobalSearchTimeout(3)
@@ -255,8 +407,8 @@ class MonitorWorker(threading.Thread):
                 try:
                     self._process_commands()
                     self._tick()
-                except Exception as e:  # monitor nie może umrzeć po cichu
-                    self.log(f"BŁĄD monitora: {e!r}")
+                except Exception as e:  # the monitor must not die silently
+                    self.log("log_monitor_error", "bad", err=repr(e))
                     time.sleep(2)
                 time.sleep(0.5)
         allow_sleep()
@@ -278,23 +430,23 @@ class MonitorWorker(threading.Thread):
                         self.hwnd = wins[0][0]
                         self.emit("windows", wins)
                 if not self.hwnd:
-                    self.log("Nie znaleziono okna Claude — uruchom aplikację Claude i odśwież.")
+                    self.log("log_no_window_start", "warn")
                     continue
                 self.state = self.MONITORING
                 self.retries = 0
                 self.next_scan = 0.0
                 if self.cfg["keep_awake"]:
                     keep_awake(False)
-                self.log("Monitoring uruchomiony.")
+                self.log("log_started")
                 self.emit("state", self._state_info())
             elif name == "stop":
                 self.state = self.IDLE
                 self.reset_at = self.send_at = None
                 allow_sleep()
-                self.log("Monitoring zatrzymany.")
+                self.log("log_stopped")
                 self.emit("state", self._state_info())
             elif name == "send_now":
-                self.log("Ręczna wysyłka 'continue'...")
+                self.log("log_manual_send")
                 self._do_send(manual=True)
             elif name == "arm_manual":
                 self.reset_at = payload
@@ -303,8 +455,9 @@ class MonitorWorker(threading.Thread):
                 self.retries = 0
                 if self.cfg["keep_awake"]:
                     keep_awake(True)
-                self.log(f"Uzbrojono ręcznie: reset {payload:%Y-%m-%d %H:%M}, "
-                         f"wysyłka {self.send_at:%H:%M:%S}.")
+                self.log("log_armed_manual",
+                         reset=f"{payload:%Y-%m-%d %H:%M}",
+                         send=f"{self.send_at:%H:%M:%S}")
                 self.emit("state", self._state_info())
             elif name == "config":
                 self.cfg.update(payload)
@@ -320,12 +473,12 @@ class MonitorWorker(threading.Thread):
                 if self.cfg["auto_send"]:
                     self._do_send()
                 else:
-                    self.log("Czas wysyłki minął, ale auto-wysyłka jest WYŁĄCZONA — tylko alarm.")
+                    self.log("log_autosend_off", "warn")
                     self.emit("beep", None)
                     self.state = self.MONITORING
                     self.emit("state", self._state_info())
             elif now >= self.next_scan:
-                # odświeżaj godzinę resetu (baner może się zaktualizować)
+                # keep refreshing the reset time (the banner may update)
                 self.next_scan = now + max(60, self.cfg["scan_interval_s"])
                 self._scan_and_decide(refresh_only=True)
             self.emit("countdown", self._state_info())
@@ -333,14 +486,14 @@ class MonitorWorker(threading.Thread):
             if dt.datetime.now() >= self.verify_at:
                 self._verify_after_send()
 
-    # ---------------------------------------------------------------- skanowanie
+    # ---------------------------------------------------------------- scanning
     def _get_window(self):
         if not self.hwnd or not user32.IsWindow(self.hwnd):
             wins = self._enum_windows()
             if wins:
                 self.hwnd = wins[0][0]
                 self.emit("windows", wins)
-                self.log(f"Okno Claude odnalezione ponownie (uchwyt {self.hwnd}).")
+                self.log("log_window_refound", hwnd=self.hwnd)
             else:
                 return None
         try:
@@ -349,7 +502,7 @@ class MonitorWorker(threading.Thread):
             return None
 
     def _enum_windows(self):
-        """Lista (hwnd, tytuł) okien procesu claude.exe."""
+        """List of (hwnd, title) for claude.exe windows."""
         result = []
         try:
             for w in auto.GetRootControl().GetChildren():
@@ -368,7 +521,7 @@ class MonitorWorker(threading.Thread):
 
     @staticmethod
     def _wake_accessibility(win):
-        """Chromium buduje drzewo dostępności dopiero, gdy klient o nie pyta."""
+        """Chromium builds the accessibility tree only when a client asks for it."""
         try:
             for ctrl, _ in auto.WalkControl(win, includeTop=False, maxDepth=80):
                 if ctrl.ControlTypeName == "DocumentControl":
@@ -386,7 +539,7 @@ class MonitorWorker(threading.Thread):
             pass
 
     def _collect(self, win, budget_s=30.0):
-        """Zwraca (teksty_poza_czatem, kontrolka_prompt, tytuł_sesji)."""
+        """Return (texts_outside_chat, prompt_control, session_title)."""
         self._wake_accessibility(win)
         time.sleep(0.7)
 
@@ -413,7 +566,7 @@ class MonitorWorker(threading.Thread):
 
             if exclude_depth is not None:
                 if depth > exclude_depth:
-                    continue        # wnętrze wykluczonej grupy (czat/sidebar)
+                    continue        # inside an excluded group (chat/sidebar)
                 exclude_depth = None
             if ct == "GroupControl" and name.strip().lower() in EXCLUDED_GROUPS:
                 exclude_depth = depth
@@ -432,7 +585,7 @@ class MonitorWorker(threading.Thread):
                 except Exception:
                     pass
 
-            # najlepszy strzał w tytuł aktywnej sesji: tekst w górnym pasku
+            # best guess at the active session title: text in the top bar
             if session_title is None and win_rect and ct in ("ButtonControl", "TextControl"):
                 try:
                     r = ctrl.BoundingRectangle
@@ -447,7 +600,7 @@ class MonitorWorker(threading.Thread):
     def _scan_and_decide(self, refresh_only=False):
         win = self._get_window()
         if not win:
-            self.emit("status", "Nie widzę okna Claude — czekam...")
+            self.emit("status", "no_window")
             return
         texts, _prompt, session = self._collect(win)
         joined = "  ".join(texts)
@@ -469,12 +622,11 @@ class MonitorWorker(threading.Thread):
         hard = find_hard_limit(joined, self.cfg.get("extra_hard_patterns", ()))
         if not hard:
             if self.state == self.ARMED:
-                # komunikat zniknął na długo przed resetem -> pewnie wznowiono ręcznie
+                # message gone well before reset -> probably resumed manually
                 if self.reset_at and dt.datetime.now() < self.reset_at - dt.timedelta(minutes=3):
                     self.miss_count += 1
                     if self.miss_count >= 3:
-                        self.log("Komunikat o limicie zniknął przed resetem — "
-                                 "rozbrajam i wracam do monitoringu.")
+                        self.log("log_banner_gone")
                         self.state = self.MONITORING
                         self.reset_at = self.send_at = None
                         self.miss_count = 0
@@ -482,10 +634,10 @@ class MonitorWorker(threading.Thread):
                             keep_awake(False)
                         self.emit("state", self._state_info())
             elif self.state == self.MONITORING:
-                self.emit("status", "OK — limit nie jest strzelony.")
+                self.emit("status", "ok")
             return
 
-        # twardy limit wykryty
+        # hard limit detected
         self.miss_count = 0
         if reset_seen:
             new_send = reset_seen + dt.timedelta(seconds=self.cfg["send_delay_after_reset_s"])
@@ -494,11 +646,12 @@ class MonitorWorker(threading.Thread):
                 self.reset_at = reset_seen
                 self.send_at = new_send
                 if self.state != self.ARMED:
-                    self.log(f"LIMIT WYKRYTY ({hard!r}). Reset: {reset_seen:%a %H:%M}. "
-                             f"Wyślę 'continue' o {new_send:%H:%M:%S}.")
+                    self.log("log_limit_detected", "warn", hard=hard,
+                             reset=f"{reset_seen:%a %H:%M}",
+                             send=f"{new_send:%H:%M:%S}")
                     self.emit("beep", None)
                 else:
-                    self.log(f"Zaktualizowano czas resetu: {reset_seen:%a %H:%M}.")
+                    self.log("log_reset_updated", reset=f"{reset_seen:%a %H:%M}")
                 self.state = self.ARMED
                 if self.cfg["keep_awake"]:
                     keep_awake(True)
@@ -509,14 +662,14 @@ class MonitorWorker(threading.Thread):
                 self.reset_at = None
                 self.send_at = fallback
                 self.state = self.ARMED
-                self.log(f"LIMIT WYKRYTY ({hard!r}), ale nie umiem odczytać godziny resetu. "
-                         f"Spróbuję wysłać o {fallback:%H:%M:%S} i będę ponawiać.")
+                self.log("log_limit_no_time", "warn", hard=hard,
+                         send=f"{fallback:%H:%M:%S}")
                 self.emit("beep", None)
                 if self.cfg["keep_awake"]:
                     keep_awake(True)
                 self.emit("state", self._state_info())
 
-    # ------------------------------------------------------------------ wysyłka
+    # ------------------------------------------------------------------ sending
     def _focus_window(self, hwnd):
         SW_RESTORE = 9
         if user32.IsIconic(hwnd):
@@ -529,7 +682,7 @@ class MonitorWorker(threading.Thread):
     def _do_send(self, manual=False):
         win = self._get_window()
         if not win:
-            self.log("WYSYŁKA NIEUDANA: brak okna Claude.")
+            self.log("log_send_fail_nowin", "bad")
             self._after_send_failed()
             return
         hwnd = self.hwnd
@@ -543,7 +696,7 @@ class MonitorWorker(threading.Thread):
                 except Exception:
                     prompt = None
             if prompt is None:
-                # awaryjnie: klik nad dolnym paskiem przycisków, na środku okna
+                # fallback: click just above the bottom button bar, window center
                 r = win.BoundingRectangle
                 auto.Click(int((r.left + r.right) / 2), int(r.bottom - 80))
             time.sleep(0.6)
@@ -552,18 +705,17 @@ class MonitorWorker(threading.Thread):
                 self._focus_window(hwnd)
                 time.sleep(0.4)
             if user32.GetForegroundWindow() != hwnd:
-                self.log("WYSYŁKA PRZERWANA: okno Claude nie jest na wierzchu "
-                         "(nie będę pisać do innej aplikacji).")
+                self.log("log_send_abort_fg", "bad")
                 self._after_send_failed()
                 return
 
             auto.SendKeys(self.cfg["message"], interval=0.03, waitTime=0.2)
             time.sleep(0.3)
             auto.SendKeys("{Enter}", waitTime=0.2)
-            self.log(f"Wysłano '{self.cfg['message']}' + Enter.")
+            self.log("log_sent", "good", message=self.cfg["message"])
             self.emit("beep", None)
         except Exception as e:
-            self.log(f"WYSYŁKA NIEUDANA: {e!r}")
+            self.log("log_send_fail", "bad", err=repr(e))
             self._after_send_failed()
             return
 
@@ -577,13 +729,13 @@ class MonitorWorker(threading.Thread):
         if self.state in (self.ARMED, self.VERIFY):
             self.retries += 1
             if self.retries > self.cfg["max_retries"]:
-                self.log("Wyczerpano próby — wracam do zwykłego monitoringu.")
+                self.log("log_retries_done", "warn")
                 self.state = self.MONITORING
             else:
                 self.send_at = dt.datetime.now() + dt.timedelta(seconds=300)
                 self.state = self.ARMED
-                self.log(f"Ponowna próba o {self.send_at:%H:%M:%S} "
-                         f"({self.retries}/{self.cfg['max_retries']}).")
+                self.log("log_retry_at", send=f"{self.send_at:%H:%M:%S}",
+                         n=self.retries, max=self.cfg["max_retries"])
             self.emit("state", self._state_info())
 
     def _verify_after_send(self):
@@ -598,7 +750,7 @@ class MonitorWorker(threading.Thread):
         if hard:
             self.retries += 1
             if self.retries > self.cfg["max_retries"]:
-                self.log("Limit nadal aktywny, wyczerpano próby — monitoruję dalej.")
+                self.log("log_still_done", "warn")
                 self.state = self.MONITORING
             else:
                 new_reset = parse_reset_time(joined)
@@ -606,16 +758,16 @@ class MonitorWorker(threading.Thread):
                     self.reset_at = new_reset
                     self.send_at = new_reset + dt.timedelta(
                         seconds=self.cfg["send_delay_after_reset_s"])
-                    self.log(f"Limit nadal aktywny — nowy reset {new_reset:%a %H:%M}, "
-                             f"wysyłka o {self.send_at:%H:%M:%S}.")
+                    self.log("log_still_new", reset=f"{new_reset:%a %H:%M}",
+                             send=f"{self.send_at:%H:%M:%S}")
                 else:
                     self.send_at = dt.datetime.now() + dt.timedelta(
                         seconds=self.cfg["retry_wait_s"])
-                    self.log(f"Limit nadal aktywny — ponowię o {self.send_at:%H:%M:%S} "
-                             f"({self.retries}/{self.cfg['max_retries']}).")
+                    self.log("log_still_retry", send=f"{self.send_at:%H:%M:%S}",
+                             n=self.retries, max=self.cfg["max_retries"])
                 self.state = self.ARMED
         else:
-            self.log("SUKCES — limit zniknął, sesja wznowiona. Monitoruję dalej.")
+            self.log("log_success", "good")
             self.retries = 0
             self.reset_at = self.send_at = None
             self.state = self.MONITORING
@@ -630,31 +782,30 @@ class MonitorWorker(threading.Thread):
             "send_at": self.send_at,
         }
 
-# ------------------------------------------------------------------ motyw UI
+# ------------------------------------------------------------------ UI theme
 
 THEME = {
-    "bg":        "#14161B",   # noc — ciepły grafit
+    "bg":        "#14161B",   # night — warm graphite
     "panel":     "#1C1F26",
     "panel_hi":  "#242935",
     "border":    "#2A2E38",
-    "text":      "#E9E4D6",   # pergamin przy przygaszonej lampie
+    "text":      "#E9E4D6",   # parchment under a dimmed lamp
     "muted":     "#8B92A0",
     "log_bg":    "#101216",
     "log_fg":    "#A8B0BE",
-    "green":     "#7BAE7F",   # czuwanie
-    "amber":     "#E0A458",   # limit / uzbrojenie
+    "green":     "#7BAE7F",   # watching
+    "amber":     "#E0A458",   # limit / armed
     "amber_dim": "#8A6A3F",
-    "blue":      "#7FA8D9",   # weryfikacja
+    "blue":      "#7FA8D9",   # verifying
     "red":       "#D98080",
     "track":     "#2A2E38",
 }
 
-STATE_VIEW = {
-    "IDLE":       ("Czuwanie wyłączone", "muted"),
-    "MONITORING": ("Czuwam nad sesją", "green"),
-    "ARMED":      ("Limit strzelony — czekam na reset", "amber"),
-    "VERIFY":     ("Wysłano — sprawdzam efekt", "blue"),
-}
+# state -> lamp color key + label string key
+STATE_COLOR = {"IDLE": "muted", "MONITORING": "green",
+               "ARMED": "amber", "VERIFY": "blue"}
+STATE_LABEL = {"IDLE": "state_idle", "MONITORING": "state_monitoring",
+               "ARMED": "state_armed", "VERIFY": "state_verify"}
 
 
 def pick_fonts(root):
@@ -670,7 +821,7 @@ def enable_dark_titlebar(root):
         root.update_idletasks()
         hwnd = user32.GetParent(root.winfo_id())
         val = ctypes.c_int(1)
-        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (i starszy wariant)
+        for attr in (20, 19):  # DWMWA_USE_IMMERSIVE_DARK_MODE (and older variant)
             if ctypes.windll.dwmapi.DwmSetWindowAttribute(
                     hwnd, attr, ctypes.byref(val), ctypes.sizeof(val)) == 0:
                 break
@@ -681,23 +832,26 @@ def enable_dark_titlebar(root):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Claude Auto-Continue")
-        self.geometry("680x640")
-        self.minsize(620, 540)
+        self.title("Claude Auto-Resume")
+        self.geometry("680x660")
+        self.minsize(620, 560)
         self.configure(bg=THEME["bg"])
 
         self.cfg = load_config()
+        self.lang = self.cfg.get("language", "en")
         self.out_queue = queue.Queue()
         self.worker = MonitorWorker(self.out_queue, self.cfg)
-        self.windows = []            # [(hwnd, tytuł)]
+        self.windows = []            # [(hwnd, title)]
         self.state_info = {"state": "IDLE", "reset_at": None, "send_at": None}
         self.usage = {}              # used / plan / reset / session
         self.armed_since = None
-        self._blink = False
+        self.last_status = ""        # "" | "no_window" | "ok"
 
         self.font_ui, self.font_mono = pick_fonts(self)
         self._build_styles()
         self._build_ui()
+        self._retext()
+        self._update_lang_buttons()
         enable_dark_titlebar(self)
 
         self.worker.start()
@@ -719,10 +873,6 @@ class App(tk.Tk):
         style.configure("Panel.TFrame", background=t["panel"])
         style.configure("TLabel", background=t["bg"], foreground=t["text"])
         style.configure("Panel.TLabel", background=t["panel"])
-        style.configure("Muted.TLabel", background=t["bg"], foreground=t["muted"],
-                        font=(self.font_ui, 9))
-        style.configure("PanelMuted.TLabel", background=t["panel"],
-                        foreground=t["muted"], font=(self.font_ui, 9))
         style.configure("Section.TLabel", background=t["bg"], foreground=t["muted"],
                         font=(self.font_ui, 9, "bold"))
         style.configure("TButton", background=t["panel_hi"], foreground=t["text"],
@@ -759,7 +909,6 @@ class App(tk.Tk):
         style.map("Vertical.TScrollbar",
                   background=[("active", "#2E3543"), ("pressed", "#38404F")],
                   arrowcolor=[("active", t["text"])])
-        # lista rozwijana comboboksa (zwykły Listbox tk)
         self.option_add("*TCombobox*Listbox.background", t["panel_hi"])
         self.option_add("*TCombobox*Listbox.foreground", t["text"])
         self.option_add("*TCombobox*Listbox.selectBackground", t["amber_dim"])
@@ -771,7 +920,23 @@ class App(tk.Tk):
         root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        # --- pasek instrumentu: lampka, stan, wielki zegar, postęp, zużycie ---
+        # --- top bar: wordmark + EN/PL toggle ---
+        top = tk.Frame(root, bg=t["bg"])
+        top.pack(fill="x", pady=(0, 8))
+        tk.Label(top, text="CLAUDE AUTO-RESUME", bg=t["bg"], fg=t["muted"],
+                 font=(self.font_ui, 9, "bold")).pack(side="left")
+        seg = tk.Frame(top, bg=t["border"])
+        seg.pack(side="right")
+        self.lang_btns = {}
+        for code in ("en", "pl"):
+            b = tk.Label(seg, text=code.upper(), bg=t["panel_hi"], fg=t["muted"],
+                         font=(self.font_ui, 8, "bold"), width=3, pady=2,
+                         cursor="hand2")
+            b.pack(side="left", padx=1, pady=1)
+            b.bind("<Button-1>", lambda _e, c=code: self._set_lang(c))
+            self.lang_btns[code] = b
+
+        # --- instrument panel: lamp, state, big clock, progress, usage ---
         head = tk.Frame(root, bg=t["panel"], highlightbackground=t["border"],
                         highlightthickness=1)
         head.pack(fill="x")
@@ -785,16 +950,14 @@ class App(tk.Tk):
         self.lamp.pack(side="left", pady=4)
         self.lamp_id = self.lamp.create_oval(2, 2, 12, 12,
                                              fill=t["muted"], outline="")
-        self.lbl_state = tk.Label(row_state, text="Czuwanie wyłączone",
-                                  bg=t["panel"], fg=t["text"],
+        self.lbl_state = tk.Label(row_state, text="", bg=t["panel"], fg=t["text"],
                                   font=(self.font_ui, 13, "bold"))
         self.lbl_state.pack(side="left", padx=(8, 0))
         self.lbl_clock = tk.Label(row_state, text="--:--:--", bg=t["panel"],
                                   fg=t["muted"], font=(self.font_mono, 26, "bold"))
         self.lbl_clock.pack(side="right")
 
-        self.lbl_caption = tk.Label(head_in, text="Kliknij „Rozpocznij czuwanie”.",
-                                    bg=t["panel"], fg=t["muted"],
+        self.lbl_caption = tk.Label(head_in, text="", bg=t["panel"], fg=t["muted"],
                                     font=(self.font_ui, 9), anchor="w")
         self.lbl_caption.pack(fill="x", pady=(2, 8))
 
@@ -806,7 +969,7 @@ class App(tk.Tk):
 
         row_usage = tk.Frame(head_in, bg=t["panel"])
         row_usage.pack(fill="x", pady=(10, 0))
-        self.lbl_used = tk.Label(row_usage, text="limit modelu —", bg=t["panel"],
+        self.lbl_used = tk.Label(row_usage, text="", bg=t["panel"],
                                  fg=t["muted"], font=(self.font_ui, 9))
         self.lbl_used.pack(side="left")
         self.bar_used = tk.Canvas(row_usage, width=90, height=5, bg=t["track"],
@@ -814,7 +977,7 @@ class App(tk.Tk):
         self.bar_used.pack(side="left", padx=(6, 18), pady=1)
         self.bar_used_fill = self.bar_used.create_rectangle(
             0, 0, 0, 5, fill=t["green"], outline="")
-        self.lbl_plan = tk.Label(row_usage, text="plan —", bg=t["panel"],
+        self.lbl_plan = tk.Label(row_usage, text="", bg=t["panel"],
                                  fg=t["muted"], font=(self.font_ui, 9))
         self.lbl_plan.pack(side="left")
         self.bar_plan = tk.Canvas(row_usage, width=90, height=5, bg=t["track"],
@@ -826,9 +989,9 @@ class App(tk.Tk):
                                        fg=t["muted"], font=(self.font_ui, 9))
         self.lbl_reset_seen.pack(side="right")
 
-        # ----------------------------------------------------------- sterowanie
-        ttk.Label(root, text="STEROWANIE", style="Section.TLabel").pack(
-            anchor="w", pady=(14, 4))
+        # ----------------------------------------------------------- control
+        self.sec_control = ttk.Label(root, text="", style="Section.TLabel")
+        self.sec_control.pack(anchor="w", pady=(14, 4))
         panel = tk.Frame(root, bg=t["panel"], highlightbackground=t["border"],
                          highlightthickness=1)
         panel.pack(fill="x")
@@ -837,60 +1000,67 @@ class App(tk.Tk):
 
         row_win = tk.Frame(panel_in, bg=t["panel"])
         row_win.pack(fill="x", pady=(0, 8))
-        tk.Label(row_win, text="Okno Claude:", bg=t["panel"], fg=t["text"],
-                 font=(self.font_ui, 10)).pack(side="left")
+        self.lbl_window = tk.Label(row_win, text="", bg=t["panel"], fg=t["text"],
+                                   font=(self.font_ui, 10))
+        self.lbl_window.pack(side="left")
         self.cmb_windows = ttk.Combobox(row_win, state="readonly", width=40)
         self.cmb_windows.pack(side="left", padx=8)
         self.cmb_windows.bind("<<ComboboxSelected>>", self._on_window_selected)
-        ttk.Button(row_win, text="Odśwież", command=lambda: self.worker.command(
-            "refresh_windows")).pack(side="left")
+        self.btn_refresh = ttk.Button(
+            row_win, text="", command=lambda: self.worker.command("refresh_windows"))
+        self.btn_refresh.pack(side="left")
 
         row_btn = tk.Frame(panel_in, bg=t["panel"])
         row_btn.pack(fill="x", pady=(0, 8))
-        self.btn_start = ttk.Button(row_btn, text="Rozpocznij czuwanie",
-                                    style="Primary.TButton", command=self._on_start)
+        self.btn_start = ttk.Button(row_btn, text="", style="Primary.TButton",
+                                    command=self._on_start)
         self.btn_start.pack(side="left")
-        self.btn_stop = ttk.Button(row_btn, text="Zatrzymaj",
-                                   command=self._on_stop, state="disabled")
+        self.btn_stop = ttk.Button(row_btn, text="", command=self._on_stop,
+                                   state="disabled")
         self.btn_stop.pack(side="left", padx=8)
-        ttk.Button(row_btn, text="Wyślij „continue” teraz",
-                   command=self._on_send_now).pack(side="right")
+        self.btn_send_now = ttk.Button(row_btn, text="", command=self._on_send_now)
+        self.btn_send_now.pack(side="right")
 
         row_opt = tk.Frame(panel_in, bg=t["panel"])
         row_opt.pack(fill="x", pady=(0, 8))
-        tk.Label(row_opt, text="Skanuj co", bg=t["panel"], fg=t["text"],
-                 font=(self.font_ui, 10)).pack(side="left")
+        self.lbl_scan_every = tk.Label(row_opt, text="", bg=t["panel"],
+                                       fg=t["text"], font=(self.font_ui, 10))
+        self.lbl_scan_every.pack(side="left")
         self.var_interval = tk.IntVar(value=self.cfg["scan_interval_s"])
         ttk.Spinbox(row_opt, from_=5, to=300, width=4,
                     textvariable=self.var_interval,
                     command=self._push_config).pack(side="left", padx=4)
-        tk.Label(row_opt, text="s", bg=t["panel"], fg=t["text"],
-                 font=(self.font_ui, 10)).pack(side="left", padx=(0, 16))
+        self.lbl_seconds = tk.Label(row_opt, text="", bg=t["panel"], fg=t["text"],
+                                    font=(self.font_ui, 10))
+        self.lbl_seconds.pack(side="left", padx=(0, 16))
         self.var_autosend = tk.BooleanVar(value=self.cfg["auto_send"])
-        ttk.Checkbutton(row_opt, text="Wysyłaj automatycznie",
-                        style="Panel.TCheckbutton", variable=self.var_autosend,
-                        command=self._push_config).pack(side="left", padx=(0, 16))
+        self.chk_autosend = ttk.Checkbutton(
+            row_opt, text="", style="Panel.TCheckbutton",
+            variable=self.var_autosend, command=self._push_config)
+        self.chk_autosend.pack(side="left", padx=(0, 16))
         self.var_awake = tk.BooleanVar(value=self.cfg["keep_awake"])
-        ttk.Checkbutton(row_opt, text="Nie usypiaj komputera",
-                        style="Panel.TCheckbutton", variable=self.var_awake,
-                        command=self._push_config).pack(side="left")
+        self.chk_awake = ttk.Checkbutton(
+            row_opt, text="", style="Panel.TCheckbutton",
+            variable=self.var_awake, command=self._push_config)
+        self.chk_awake.pack(side="left")
 
         row_manual = tk.Frame(panel_in, bg=t["panel"])
         row_manual.pack(fill="x")
-        tk.Label(row_manual, text="Znasz godzinę resetu?", bg=t["panel"],
-                 fg=t["text"], font=(self.font_ui, 10)).pack(side="left")
+        self.lbl_know_reset = tk.Label(row_manual, text="", bg=t["panel"],
+                                       fg=t["text"], font=(self.font_ui, 10))
+        self.lbl_know_reset.pack(side="left")
         self.ent_manual = ttk.Entry(row_manual, width=7)
         self.ent_manual.pack(side="left", padx=8)
         self.ent_manual.bind("<Return>", lambda _e: self._on_arm_manual())
-        ttk.Button(row_manual, text="Uzbrój",
-                   command=self._on_arm_manual).pack(side="left")
-        tk.Label(row_manual, text="format HH:MM — wyślę minutę po tej godzinie",
-                 bg=t["panel"], fg=t["muted"],
-                 font=(self.font_ui, 9)).pack(side="left", padx=10)
+        self.btn_arm = ttk.Button(row_manual, text="", command=self._on_arm_manual)
+        self.btn_arm.pack(side="left")
+        self.lbl_arm_hint = tk.Label(row_manual, text="", bg=t["panel"],
+                                     fg=t["muted"], font=(self.font_ui, 9))
+        self.lbl_arm_hint.pack(side="left", padx=10)
 
-        # -------------------------------------------------------------- dziennik
-        ttk.Label(root, text="DZIENNIK", style="Section.TLabel").pack(
-            anchor="w", pady=(14, 4))
+        # -------------------------------------------------------------- log
+        self.sec_log = ttk.Label(root, text="", style="Section.TLabel")
+        self.sec_log.pack(anchor="w", pady=(14, 4))
         log_wrap = tk.Frame(root, bg=t["border"])
         log_wrap.pack(fill="both", expand=True)
         self.txt_log = tk.Text(
@@ -910,7 +1080,48 @@ class App(tk.Tk):
 
         self.progress.bind("<Configure>", lambda _e: self._draw_progress())
 
-    # ----------------------------------------------------------------- zdarzenia
+    # ------------------------------------------------------------------ i18n
+    def _T(self, key, **kw):
+        return tr(self.lang, key, **kw)
+
+    def _set_lang(self, code):
+        if code == self.lang or code not in ("en", "pl"):
+            return
+        self.lang = code
+        self.cfg["language"] = code
+        save_config(self.cfg)
+        self.worker.command("config", {"language": code})
+        self._update_lang_buttons()
+        self._retext()
+
+    def _update_lang_buttons(self):
+        for code, btn in self.lang_btns.items():
+            active = code == self.lang
+            btn.config(fg=THEME["amber"] if active else THEME["muted"],
+                       bg=THEME["panel_hi"] if active else THEME["panel"])
+
+    def _retext(self):
+        """Re-apply all static strings in the current language."""
+        self.sec_control.config(text=self._T("sec_control"))
+        self.sec_log.config(text=self._T("sec_log"))
+        self.lbl_window.config(text=self._T("lbl_window"))
+        self.btn_refresh.config(text=self._T("btn_refresh"))
+        self.btn_start.config(text=self._T("btn_start"))
+        self.btn_stop.config(text=self._T("btn_stop"))
+        self.btn_send_now.config(text=self._T("btn_send_now"))
+        self.lbl_scan_every.config(text=self._T("lbl_scan_every"))
+        self.lbl_seconds.config(text=self._T("lbl_seconds"))
+        self.chk_autosend.config(text=self._T("chk_autosend"))
+        self.chk_awake.config(text=self._T("chk_awake"))
+        self.lbl_know_reset.config(text=self._T("lbl_know_reset"))
+        self.btn_arm.config(text=self._T("btn_arm"))
+        self.lbl_arm_hint.config(text=self._T("lbl_arm_hint"))
+        self._rebuild_window_combo()
+        self._render_state()
+        self._render_usage()
+        self._update_caption()
+
+    # ----------------------------------------------------------------- events
     def _on_window_selected(self, _event):
         idx = self.cmb_windows.current()
         if 0 <= idx < len(self.windows):
@@ -924,24 +1135,20 @@ class App(tk.Tk):
         self.worker.command("stop")
 
     def _on_send_now(self):
-        if messagebox.askyesno(
-                "Potwierdź wysyłkę",
-                "Wpisać „continue” i wcisnąć Enter w oknie Claude teraz?"):
+        if messagebox.askyesno(self._T("dlg_send_title"), self._T("dlg_send_body")):
             self.worker.command("send_now")
 
     def _on_arm_manual(self):
         raw = self.ent_manual.get().strip()
         m = re.fullmatch(r"(\d{1,2}):(\d{2})", raw)
         if not m:
-            messagebox.showerror(
-                "Nieprawidłowa godzina",
-                "Wpisz godzinę resetu w formacie HH:MM, np. 15:00.")
+            messagebox.showerror(self._T("dlg_time_title"),
+                                 self._T("dlg_time_format"))
             return
         h, mi = int(m.group(1)), int(m.group(2))
         if not (0 <= h <= 23 and 0 <= mi <= 59):
-            messagebox.showerror(
-                "Nieprawidłowa godzina",
-                "Godzina musi być z zakresu 00:00–23:59.")
+            messagebox.showerror(self._T("dlg_time_title"),
+                                 self._T("dlg_time_range"))
             return
         t = dt.datetime.now().replace(hour=h, minute=mi, second=0, microsecond=0)
         if t <= dt.datetime.now():
@@ -963,7 +1170,7 @@ class App(tk.Tk):
         save_config(self.cfg)
         self.worker.command("config", payload)
 
-    # ------------------------------------------------------------- kolejka z wątku
+    # ------------------------------------------------------------- worker queue
     def _poll_queue(self):
         try:
             while True:
@@ -975,27 +1182,21 @@ class App(tk.Tk):
 
     def _handle_event(self, kind, data):
         if kind == "log":
-            tag = ()
-            if any(k in data for k in ("NIEUDANA", "PRZERWANA", "BŁĄD")):
-                tag = ("bad",)
-            elif "LIMIT WYKRYTY" in data:
-                tag = ("warn",)
-            elif "SUKCES" in data or "Wysłano" in data:
-                tag = ("good",)
+            line, level = data
+            tag = (level,) if level in ("warn", "good", "bad") else ()
             self.txt_log.configure(state="normal")
-            self.txt_log.insert("end", data + "\n", tag)
+            self.txt_log.insert("end", line + "\n", tag)
             self.txt_log.see("end")
             self.txt_log.configure(state="disabled")
         elif kind == "windows":
             self.windows = data
-            vals = [f"{title}  (uchwyt {hwnd})" for hwnd, title in data]
-            self.cmb_windows["values"] = vals
+            self._rebuild_window_combo()
             if data and self.cmb_windows.current() < 0:
                 self.cmb_windows.current(0)
                 self.worker.command("select_window", data[0][0])
             if not data:
-                self.lbl_caption.config(text="Nie widzę okna Claude — uruchom "
-                                             "aplikację i kliknij „Odśwież”.")
+                self.last_status = "no_window"
+                self._update_caption()
         elif kind == "usage":
             self.usage.update(data)
             self._render_usage()
@@ -1016,7 +1217,15 @@ class App(tk.Tk):
             except Exception:
                 pass
 
-    # ------------------------------------------------------------------ rysowanie
+    # ------------------------------------------------------------------ drawing
+    def _rebuild_window_combo(self):
+        vals = [self._T("combo_handle", title=title, hwnd=hwnd)
+                for hwnd, title in self.windows]
+        keep = self.cmb_windows.current()
+        self.cmb_windows["values"] = vals
+        if 0 <= keep < len(vals):
+            self.cmb_windows.current(keep)
+
     def _render_usage(self):
         u = self.usage
 
@@ -1029,23 +1238,59 @@ class App(tk.Tk):
             canvas.itemconfigure(fill_id, fill=color)
 
         if "used" in u:
-            self.lbl_used.config(text=f"limit modelu {u['used']}%")
+            self.lbl_used.config(text=self._T("usage_model", pct=u["used"]))
             bar(self.bar_used, self.bar_used_fill, u["used"])
+        else:
+            self.lbl_used.config(text=self._T("usage_model_none"))
         if "plan" in u:
-            self.lbl_plan.config(text=f"plan {u['plan']}%")
+            self.lbl_plan.config(text=self._T("usage_plan", pct=u["plan"]))
             bar(self.bar_plan, self.bar_plan_fill, u["plan"])
+        else:
+            self.lbl_plan.config(text=self._T("usage_plan_none"))
         if "reset" in u:
             self.lbl_reset_seen.config(
-                text=f"zapowiedziany reset: {u['reset']:%a %d.%m %H:%M}")
+                text=self._T("usage_reset_seen",
+                             reset=f"{u['reset']:%a %d.%m %H:%M}"))
 
     def _render_state(self):
         st = self.state_info["state"]
         running = st != "IDLE"
         self.btn_start.config(state="disabled" if running else "normal")
         self.btn_stop.config(state="normal" if running else "disabled")
-        label, color_key = STATE_VIEW[st]
-        self.lbl_state.config(text=label)
-        self.lamp.itemconfigure(self.lamp_id, fill=THEME[color_key])
+        self.lbl_state.config(text=self._T(STATE_LABEL[st]))
+        self.lamp.itemconfigure(self.lamp_id, fill=THEME[STATE_COLOR[st]])
+
+    def _update_caption(self):
+        """Set the header caption from current state (language-aware)."""
+        st = self.state_info["state"]
+        now = dt.datetime.now()
+        if st == "IDLE":
+            self.lbl_caption.config(text=self._T("cap_click_start"))
+        elif st == "MONITORING":
+            if self.last_status == "no_window":
+                self.lbl_caption.config(text=self._T("cap_no_window"))
+            elif self.usage.get("session"):
+                self.lbl_caption.config(
+                    text=self._T("cap_guarding",
+                                 session=self.usage["session"][:60]))
+            else:
+                self.lbl_caption.config(
+                    text=self._T("cap_scanning", sec=self.cfg["scan_interval_s"]))
+        elif st == "ARMED":
+            send_at = self.state_info.get("send_at")
+            if send_at:
+                reset_at = self.state_info.get("reset_at")
+                if reset_at:
+                    self.lbl_caption.config(
+                        text=self._T("cap_armed_reset",
+                                     reset=f"{reset_at:%a %H:%M}",
+                                     send=f"{send_at:%H:%M:%S}"))
+                else:
+                    self.lbl_caption.config(
+                        text=self._T("cap_armed_noreset",
+                                     send=f"{send_at:%H:%M:%S}"))
+        elif st == "VERIFY":
+            self.lbl_caption.config(text=self._T("cap_verify"))
 
     def _tick_ui(self):
         st = self.state_info["state"]
@@ -1054,18 +1299,8 @@ class App(tk.Tk):
 
         if st == "IDLE":
             self.lbl_clock.config(text=f"{now:%H:%M:%S}", fg=t["muted"])
-            self.lbl_caption.config(text="Kliknij „Rozpocznij czuwanie”.")
         elif st == "MONITORING":
             self.lbl_clock.config(text=f"{now:%H:%M:%S}", fg=t["text"])
-            session = self.usage.get("session")
-            status = getattr(self, "last_status", "")
-            if status.startswith("Nie widzę"):
-                self.lbl_caption.config(text=status)
-            elif session:
-                self.lbl_caption.config(text=f"Pilnuję sesji: {session[:60]}")
-            else:
-                self.lbl_caption.config(
-                    text=f"Skanuję okno Claude co {self.cfg['scan_interval_s']} s.")
         elif st == "ARMED":
             send_at = self.state_info.get("send_at")
             if send_at:
@@ -1073,23 +1308,13 @@ class App(tk.Tk):
                 h, rem = divmod(secs, 3600)
                 m, s = divmod(rem, 60)
                 self.lbl_clock.config(text=f"{h:02d}:{m:02d}:{s:02d}", fg=t["amber"])
-                reset_at = self.state_info.get("reset_at")
-                if reset_at:
-                    self.lbl_caption.config(
-                        text=f"Reset {reset_at:%a %H:%M} — wyślę „continue” "
-                             f"o {send_at:%H:%M:%S}.")
-                else:
-                    self.lbl_caption.config(
-                        text=f"Nie znam godziny resetu — spróbuję "
-                             f"o {send_at:%H:%M:%S}.")
-            # lampka mruga w rytmie 1 Hz
             blink_on = int(time.time()) % 2 == 0
             self.lamp.itemconfigure(
                 self.lamp_id, fill=t["amber"] if blink_on else t["amber_dim"])
         elif st == "VERIFY":
             self.lbl_clock.config(text=f"{now:%H:%M:%S}", fg=t["blue"])
-            self.lbl_caption.config(text="Za chwilę sprawdzę, czy sesja ruszyła.")
 
+        self._update_caption()
         self._draw_progress()
         self.after(250, self._tick_ui)
 
@@ -1111,7 +1336,7 @@ class App(tk.Tk):
 
 
 def main():
-    # ostre DPI na Windows 11
+    # crisp DPI on Windows 11
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
     except Exception:
