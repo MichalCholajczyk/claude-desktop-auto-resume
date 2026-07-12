@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Dane lokalne generowane przez program
+auto_continue.log
+auto_continue_config.json
+
+# System / IDE
+Thumbs.db
+.DS_Store
+.vscode/
+.idea/
