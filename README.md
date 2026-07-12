@@ -1,4 +1,4 @@
-# Claude Desktop Auto-Resume
+# Claude Desktop App Auto-Resume for Windows 11
 
 **Don't let the 5-hour limit stop Claude in the middle of an overnight run.**
 
@@ -41,8 +41,8 @@ the overnight send actually happens.
 
 - **Windows 10 or 11**
 - **Python 3.10+** — check in a terminal: `py --version`.
-  Don't have it? Get it from [python.org](https://www.python.org/downloads/) and
-  tick *"Add Python to PATH"* during install.
+  (U can get it from [python.org](https://www.python.org/downloads/) and
+  tick *"Add Python to PATH"* during install.)
 - The **Claude Desktop** app, installed and signed in.
 
 ### Get it and run
@@ -83,6 +83,13 @@ shows how much waiting is left.
 > field (format `HH:MM`) and click **"Arm"** — the tool will send "continue" one
 > minute after that time.
 
+### Custom message
+
+By default the tool sends **`continue`**, but you can send anything you like.
+Type your own text into the **"Message to send"** field — that exact text is
+what gets sent when the limit resets (and by the "Send now" button too). Leave
+it blank to fall back to `continue`.
+
 ---
 
 ## ⚠️ Important before leaving it overnight
@@ -112,10 +119,11 @@ Available in the app window; saved to `auto_continue_config.json`:
 |---|---|---|
 | Language (EN/PL toggle) | EN | interface language |
 | Scan every (s) | 20 | how often the tool checks the Claude window |
+| Message to send | `continue` | the text sent when the limit resets |
 | Send automatically | ✔ | turn off to only get an audible alert instead of sending |
 | Keep the PC awake | ✔ | blocks system and display sleep while watching |
 
-More advanced fields (the message text, number of retries, extra limit-message
+More advanced fields (number of retries, retry spacing, extra limit-message
 patterns) can be edited directly in `auto_continue_config.json` — see below.
 
 ---

@@ -111,6 +111,7 @@ STRINGS = {
         "lbl_seconds": "s",
         "chk_autosend": "Send automatically",
         "chk_awake": "Keep the PC awake",
+        "lbl_message": "Message to send:",
         "lbl_know_reset": "Know the reset time?",
         "btn_arm": "Arm",
         "lbl_arm_hint": "format HH:MM — I’ll send a minute after that time",
@@ -173,6 +174,7 @@ STRINGS = {
         "lbl_seconds": "s",
         "chk_autosend": "Wysyłaj automatycznie",
         "chk_awake": "Nie usypiaj komputera",
+        "lbl_message": "Wysyłany tekst:",
         "lbl_know_reset": "Znasz godzinę resetu?",
         "btn_arm": "Uzbrój",
         "lbl_arm_hint": "format HH:MM — wyślę minutę po tej godzinie",
@@ -670,6 +672,20 @@ class MonitorWorker(threading.Thread):
                 self.emit("state", self._state_info())
 
     # ------------------------------------------------------------------ sending
+    @staticmethod
+    def _escape_sendkeys(s):
+        """uiautomation treats { and } as key-sequence delimiters; escape them
+        so an arbitrary user message is typed literally."""
+        out = []
+        for c in s:
+            if c == "{":
+                out.append("{{}")
+            elif c == "}":
+                out.append("{}}")
+            else:
+                out.append(c)
+        return "".join(out)
+
     def _focus_window(self, hwnd):
         SW_RESTORE = 9
         if user32.IsIconic(hwnd):
@@ -709,10 +725,11 @@ class MonitorWorker(threading.Thread):
                 self._after_send_failed()
                 return
 
-            auto.SendKeys(self.cfg["message"], interval=0.03, waitTime=0.2)
+            message = self.cfg.get("message") or "continue"
+            auto.SendKeys(self._escape_sendkeys(message), interval=0.03, waitTime=0.2)
             time.sleep(0.3)
             auto.SendKeys("{Enter}", waitTime=0.2)
-            self.log("log_sent", "good", message=self.cfg["message"])
+            self.log("log_sent", "good", message=message)
             self.emit("beep", None)
         except Exception as e:
             self.log("log_send_fail", "bad", err=repr(e))
@@ -1044,6 +1061,17 @@ class App(tk.Tk):
             variable=self.var_awake, command=self._push_config)
         self.chk_awake.pack(side="left")
 
+        row_msg = tk.Frame(panel_in, bg=t["panel"])
+        row_msg.pack(fill="x", pady=(0, 8))
+        self.lbl_message = tk.Label(row_msg, text="", bg=t["panel"],
+                                    fg=t["text"], font=(self.font_ui, 10))
+        self.lbl_message.pack(side="left")
+        self.var_message = tk.StringVar(value=self.cfg.get("message", "continue"))
+        self.ent_message = ttk.Entry(row_msg, width=32, textvariable=self.var_message)
+        self.ent_message.pack(side="left", padx=8)
+        self.ent_message.bind("<FocusOut>", lambda _e: self._commit_message())
+        self.ent_message.bind("<Return>", lambda _e: self._commit_message())
+
         row_manual = tk.Frame(panel_in, bg=t["panel"])
         row_manual.pack(fill="x")
         self.lbl_know_reset = tk.Label(row_manual, text="", bg=t["panel"],
@@ -1113,6 +1141,7 @@ class App(tk.Tk):
         self.lbl_seconds.config(text=self._T("lbl_seconds"))
         self.chk_autosend.config(text=self._T("chk_autosend"))
         self.chk_awake.config(text=self._T("chk_awake"))
+        self.lbl_message.config(text=self._T("lbl_message"))
         self.lbl_know_reset.config(text=self._T("lbl_know_reset"))
         self.btn_arm.config(text=self._T("btn_arm"))
         self.lbl_arm_hint.config(text=self._T("lbl_arm_hint"))
@@ -1156,15 +1185,25 @@ class App(tk.Tk):
         self._push_config()
         self.worker.command("arm_manual", t)
 
+    def _commit_message(self):
+        """Save the custom message; fall back to 'continue' when left blank."""
+        msg = self.var_message.get().strip()
+        if not msg:
+            msg = "continue"
+            self.var_message.set(msg)
+        self._push_config()
+
     def _push_config(self):
         try:
             interval = max(5, int(self.var_interval.get()))
         except (tk.TclError, ValueError):
             interval = DEFAULT_CONFIG["scan_interval_s"]
+        message = self.var_message.get().strip() or "continue"
         payload = {
             "scan_interval_s": interval,
             "auto_send": bool(self.var_autosend.get()),
             "keep_awake": bool(self.var_awake.get()),
+            "message": message,
         }
         self.cfg.update(payload)
         save_config(self.cfg)
