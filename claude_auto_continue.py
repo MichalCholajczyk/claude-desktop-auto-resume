@@ -51,8 +51,9 @@ DEFAULT_CONFIG = {
     "keep_awake": True,             # keep Windows from sleeping
     "max_retries": 6,               # retries while the limit is still active
     "retry_wait_s": 600,            # retry spacing when reset time is unknown
-    # extra regex patterns (case-insensitive) treated as "limit hit"
-    "extra_hard_patterns": [],
+    "limit_threshold_pct": 100,     # 5-hour limit % that counts as "hit"
+    "panel_backoff_s": 300,         # min spacing between usage-panel opens while
+                                    # the plan meter is maxed out by a weekly limit
 }
 
 
@@ -93,11 +94,11 @@ STRINGS = {
         "cap_armed_noreset": "Reset time unknown — I’ll try at {send}.",
         "cap_verify": "About to check whether the session resumed.",
         # usage row
-        "usage_model_none": "model limit —",
-        "usage_plan_none": "plan —",
-        "usage_model": "model limit {pct}%",
-        "usage_plan": "plan {pct}%",
-        "usage_reset_seen": "announced reset: {reset}",
+        "usage_5h_none": "5-hour limit —",
+        "usage_5h": "5-hour limit {pct}%",
+        "usage_weekly": "weekly {pct}%",
+        "usage_fable": "Fable {pct}%",
+        "usage_5h_reset": "resets {reset}",
         # section headers
         "sec_control": "CONTROL",
         "sec_log": "LOG",
@@ -131,10 +132,10 @@ STRINGS = {
         "log_armed_manual": "Armed manually: reset {reset}, send at {send}.",
         "log_autosend_off": "Send time passed, but auto-send is OFF — alert only.",
         "log_window_refound": "Claude window found again (handle {hwnd}).",
-        "log_banner_gone": "Limit message vanished before reset — disarming, back to watching.",
-        "log_limit_detected": "LIMIT DETECTED ({hard}). Reset: {reset}. I’ll send “continue” at {send}.",
-        "log_reset_updated": "Reset time updated: {reset}.",
-        "log_limit_no_time": "LIMIT DETECTED ({hard}), but reset time is unreadable. I’ll try at {send} and keep retrying.",
+        "log_5h_hit": "5-HOUR LIMIT HIT ({pct}%). Resets {reset}. I’ll send at {send}.",
+        "log_5h_reset_updated": "5-hour reset updated: {reset}.",
+        "log_5h_cleared": "5-hour limit is clear ({pct}%) — nothing to send, back to watching.",
+        "log_panel_unreadable": "Couldn’t read the usage panel — will try again.",
         "log_send_fail_nowin": "SEND FAILED: no Claude window.",
         "log_send_abort_fg": "SEND ABORTED: Claude window isn’t in front (won’t type into another app).",
         "log_sent": "Sent “{message}” + Enter.",
@@ -158,11 +159,11 @@ STRINGS = {
         "cap_armed_reset": "Reset {reset} — wyślę „continue” o {send}.",
         "cap_armed_noreset": "Nie znam godziny resetu — spróbuję o {send}.",
         "cap_verify": "Za chwilę sprawdzę, czy sesja ruszyła.",
-        "usage_model_none": "limit modelu —",
-        "usage_plan_none": "plan —",
-        "usage_model": "limit modelu {pct}%",
-        "usage_plan": "plan {pct}%",
-        "usage_reset_seen": "zapowiedziany reset: {reset}",
+        "usage_5h_none": "limit 5-godzinny —",
+        "usage_5h": "limit 5-godzinny {pct}%",
+        "usage_weekly": "tygodniowy {pct}%",
+        "usage_fable": "Fable {pct}%",
+        "usage_5h_reset": "reset {reset}",
         "sec_control": "STEROWANIE",
         "sec_log": "DZIENNIK",
         "lbl_window": "Okno Claude:",
@@ -192,10 +193,10 @@ STRINGS = {
         "log_armed_manual": "Uzbrojono ręcznie: reset {reset}, wysyłka {send}.",
         "log_autosend_off": "Czas wysyłki minął, ale auto-wysyłka jest WYŁĄCZONA — tylko alarm.",
         "log_window_refound": "Okno Claude odnalezione ponownie (uchwyt {hwnd}).",
-        "log_banner_gone": "Komunikat o limicie zniknął przed resetem — rozbrajam i wracam do czuwania.",
-        "log_limit_detected": "LIMIT WYKRYTY ({hard}). Reset: {reset}. Wyślę „continue” o {send}.",
-        "log_reset_updated": "Zaktualizowano czas resetu: {reset}.",
-        "log_limit_no_time": "LIMIT WYKRYTY ({hard}), ale nie umiem odczytać godziny resetu. Spróbuję o {send} i będę ponawiać.",
+        "log_5h_hit": "LIMIT 5-GODZINNY STRZELONY ({pct}%). Reset {reset}. Wyślę o {send}.",
+        "log_5h_reset_updated": "Zaktualizowano reset 5h: {reset}.",
+        "log_5h_cleared": "Limit 5-godzinny wolny ({pct}%) — nie ma czego wysyłać, wracam do czuwania.",
+        "log_panel_unreadable": "Nie udało się odczytać panelu zużycia — spróbuję ponownie.",
         "log_send_fail_nowin": "WYSYŁKA NIEUDANA: brak okna Claude.",
         "log_send_abort_fg": "WYSYŁKA PRZERWANA: okno Claude nie jest na wierzchu (nie będę pisać do innej aplikacji).",
         "log_sent": "Wysłano „{message}” + Enter.",
@@ -238,7 +239,8 @@ HARD_LIMIT_PATTERNS = [
     r"osi[ąa]gn[ąą]?[łl](?:e[śs])?\s+.{0,30}?limit",
 ]
 
-# "Resets Mon, Jul 13, 6:00 PM" / "resets 3pm" / "resets at 6:30 PM" / "resetuje się o 15:00"
+# e.g. "Resets Mon, Jul 13, 6:00 PM" / "resets 3pm" / "resets at 6:30 PM"
+# (also matches Claude's Polish UI wording, e.g. the "resetuje ... o 15:00" form)
 RE_RESET_ABS = re.compile(
     r"reset(?:s|uje(?:\s*si[eę])?)?\s*(?:at\s+|o\s+|:\s*)?"
     r"(?:(?:mon|tue|wed|thu|fri|sat|sun|pon|wt|śr|czw|pt|sob|ndz?|nie)[a-ząćęłńóśźż]*\.?,?\s+)?"
@@ -247,7 +249,7 @@ RE_RESET_ABS = re.compile(
     r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
     re.IGNORECASE)
 
-# "Resets in 2 hr 15 min" / "reset za 2 godz. 15 min"
+# relative form, e.g. "Resets in 2 hr 15 min" (English or Claude's Polish "za ... min")
 RE_RESET_REL = re.compile(
     r"reset\w*\s+(?:in|za)\s+"
     r"(?:(\d+)\s*(?:hours?|hrs?|h|godz\w*)\.?)?\s*,?\s*"
@@ -374,7 +376,9 @@ class MonitorWorker(threading.Thread):
         self.verify_at = None
         self.retries = 0
         self.next_scan = 0.0
-        self.miss_count = 0
+        self.next_panel_read = 0.0    # throttle for opening the usage popover
+        self.panel_fail = 0
+        self.last_rows = {}           # last usage-panel reading
         self._stop = threading.Event()
 
     # --- API for the UI thread (thread-safe) ---
@@ -471,6 +475,8 @@ class MonitorWorker(threading.Thread):
                 self.next_scan = now + self.cfg["scan_interval_s"]
                 self._scan_and_decide()
         elif self.state == self.ARMED:
+            # We already know the 5-hour reset time, so just wait for it — no
+            # need to keep opening the usage popover (it would flash all night).
             if dt.datetime.now() >= self.send_at:
                 if self.cfg["auto_send"]:
                     self._do_send()
@@ -479,10 +485,6 @@ class MonitorWorker(threading.Thread):
                     self.emit("beep", None)
                     self.state = self.MONITORING
                     self.emit("state", self._state_info())
-            elif now >= self.next_scan:
-                # keep refreshing the reset time (the banner may update)
-                self.next_scan = now + max(60, self.cfg["scan_interval_s"])
-                self._scan_and_decide(refresh_only=True)
             self.emit("countdown", self._state_info())
         elif self.state == self.VERIFY:
             if dt.datetime.now() >= self.verify_at:
@@ -599,6 +601,101 @@ class MonitorWorker(threading.Thread):
 
         return texts, prompt, session_title
 
+    # -------------------------------------------------- usage panel (5h limit)
+    @staticmethod
+    def _find_usage_button(win):
+        """The small round meter in the bottom bar; Name is 'Usage: ...'."""
+        for ctrl, _ in auto.WalkControl(win, includeTop=False, maxDepth=150):
+            try:
+                if ctrl.ControlTypeName == "ButtonControl" and \
+                        (ctrl.Name or "").strip().lower().startswith("usage"):
+                    return ctrl
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _find_usage_panel(win):
+        """The 'Usage' popover that appears after clicking the meter."""
+        for ctrl, _ in auto.WalkControl(win, includeTop=False, maxDepth=150):
+            try:
+                if (ctrl.Name or "").strip() == "Usage" and \
+                        ctrl.ControlTypeName in ("WindowControl", "GroupControl"):
+                    return ctrl
+            except Exception:
+                pass
+        return None
+
+    @staticmethod
+    def _parse_usage_rows(panel):
+        """Parse the flat 'label / Resets in X / N% / bar' list into per-limit
+        dicts. Returns {'5h': {pct, reset}, 'weekly': {...}, 'weekly_fable': {...}}."""
+        texts = []
+        try:
+            for ctrl, _ in auto.WalkControl(panel, includeTop=True, maxDepth=40):
+                try:
+                    n = (ctrl.Name or "").strip()
+                except Exception:
+                    continue
+                if n:
+                    texts.append(n)
+        except Exception:
+            return {}
+        rows, cur = {}, None
+        for tx in texts:
+            low = tx.lower()
+            if "5-hour" in low:
+                cur = "5h"; rows.setdefault(cur, {})
+            elif low.startswith("weekly") and "fable" in low:
+                cur = "weekly_fable"; rows.setdefault(cur, {})
+            elif low.startswith("weekly"):
+                cur = "weekly"; rows.setdefault(cur, {})
+            elif low.startswith(("context", "plan usage", "view usage", "usage")):
+                cur = None
+            elif cur:
+                mp = re.fullmatch(r"(\d{1,3})\s*%", tx)
+                if mp and "pct" not in rows[cur]:
+                    rows[cur]["pct"] = int(mp.group(1))
+                elif "reset" in low and "reset" not in rows[cur]:
+                    rt = parse_reset_time(tx)
+                    if rt:
+                        rows[cur]["reset"] = rt
+        return rows
+
+    def _read_usage_panel(self, win):
+        """Open the usage popover, read the per-limit rows, close it and restore
+        the mouse cursor. Returns (rows, ok)."""
+        btn = self._find_usage_button(win)
+        if not btn:
+            return {}, False
+        pt = ctypes.wintypes.POINT()
+        user32.GetCursorPos(ctypes.byref(pt))
+        m0 = (pt.x, pt.y)
+        try:
+            btn.Click(simulateMove=False)
+        except Exception:
+            return {}, False
+        time.sleep(1.0)
+        rows, ok = {}, False
+        try:
+            self._wake_accessibility(win)
+            panel = self._find_usage_panel(win)
+            if panel:
+                rows = self._parse_usage_rows(panel)
+                ok = "5h" in rows
+        except Exception:
+            ok = False
+        try:
+            auto.SendKeys("{Esc}", waitTime=0.05)
+        except Exception:
+            pass
+        time.sleep(0.35)
+        try:
+            user32.SetCursorPos(m0[0], m0[1])
+        except Exception:
+            pass
+        return rows, ok
+
     def _scan_and_decide(self, refresh_only=False):
         win = self._get_window()
         if not win:
@@ -607,69 +704,82 @@ class MonitorWorker(threading.Thread):
         texts, _prompt, session = self._collect(win)
         joined = "  ".join(texts)
 
-        info = {}
-        m = RE_USED_PCT.search(joined)
-        if m:
-            info["used"] = int(m.group(1))
+        # Cheap upper bound: the meter's "plan Y%" is the MAX across all limits,
+        # so the 5-hour limit can only be maxed if this is maxed too. Only then
+        # do we open the popover to check the 5-hour limit specifically.
         m = RE_PLAN_PCT.search(joined)
-        if m:
-            info["plan"] = int(m.group(1))
-        reset_seen = parse_reset_time(joined)
-        if reset_seen:
-            info["reset"] = reset_seen
+        plan_pct = int(m.group(1)) if m else None
+        threshold = self.cfg.get("limit_threshold_pct", 100)
+
+        rows = {}
+        now = time.time()
+        need_panel = (plan_pct is None or plan_pct >= threshold)
+        if need_panel and now >= self.next_panel_read:
+            rows, ok = self._read_usage_panel(win)
+            if ok:
+                self.panel_fail = 0
+                self.last_rows = rows
+            else:
+                self.panel_fail += 1
+                if self.panel_fail in (1, 5, 20):
+                    self.log("log_panel_unreadable", "warn")
+
+        info = {}
+        if plan_pct is not None:
+            info["plan"] = plan_pct
+        if self.last_rows:
+            info["rows"] = self.last_rows
         if session:
             info["session"] = session
         self.emit("usage", info)
 
-        hard = find_hard_limit(joined, self.cfg.get("extra_hard_patterns", ()))
-        if not hard:
-            if self.state == self.ARMED:
-                # message gone well before reset -> probably resumed manually
-                if self.reset_at and dt.datetime.now() < self.reset_at - dt.timedelta(minutes=3):
-                    self.miss_count += 1
-                    if self.miss_count >= 3:
-                        self.log("log_banner_gone")
-                        self.state = self.MONITORING
-                        self.reset_at = self.send_at = None
-                        self.miss_count = 0
-                        if self.cfg["keep_awake"]:
-                            keep_awake(False)
-                        self.emit("state", self._state_info())
-            elif self.state == self.MONITORING:
+        h5 = (rows or self.last_rows).get("5h", {}) if (rows or self.last_rows) else {}
+        pct = h5.get("pct")
+        reset = h5.get("reset")
+
+        # Definitely not 5-hour-limited: plan meter below threshold, or panel
+        # says the 5-hour limit is below threshold.
+        limited = False
+        if plan_pct is not None and plan_pct < threshold:
+            limited = False
+        elif pct is not None:
+            limited = pct >= threshold
+        else:
+            # couldn't read the 5-hour figure and plan is maxed -> back off,
+            # stay cautious (do not arm on an unknown).
+            self.next_panel_read = now + self.cfg.get("panel_backoff_s", 300)
+            if self.state == self.MONITORING:
                 self.emit("status", "ok")
             return
 
-        # hard limit detected
-        self.miss_count = 0
-        if reset_seen:
-            new_send = reset_seen + dt.timedelta(seconds=self.cfg["send_delay_after_reset_s"])
-            if self.state != self.ARMED or self.send_at is None or \
-                    abs((new_send - self.send_at).total_seconds()) > 90:
-                self.reset_at = reset_seen
-                self.send_at = new_send
-                if self.state != self.ARMED:
-                    self.log("log_limit_detected", "warn", hard=hard,
-                             reset=f"{reset_seen:%a %H:%M}",
-                             send=f"{new_send:%H:%M:%S}")
-                    self.emit("beep", None)
-                else:
-                    self.log("log_reset_updated", reset=f"{reset_seen:%a %H:%M}")
-                self.state = self.ARMED
-                if self.cfg["keep_awake"]:
-                    keep_awake(True)
-                self.emit("state", self._state_info())
+        if not limited:
+            # while plan stays maxed by a weekly limit, stop re-opening for a while
+            if plan_pct is not None and plan_pct >= threshold:
+                self.next_panel_read = now + self.cfg.get("panel_backoff_s", 300)
+            if self.state == self.MONITORING:
+                self.emit("status", "ok")
+            return
+
+        # 5-hour limit is genuinely hit
+        if reset:
+            new_send = reset + dt.timedelta(seconds=self.cfg["send_delay_after_reset_s"])
         else:
+            new_send = dt.datetime.now() + dt.timedelta(seconds=self.cfg["retry_wait_s"])
+        if self.state != self.ARMED or self.send_at is None or \
+                abs((new_send - self.send_at).total_seconds()) > 90:
+            self.reset_at = reset
+            self.send_at = new_send
             if self.state != self.ARMED:
-                fallback = dt.datetime.now() + dt.timedelta(seconds=self.cfg["retry_wait_s"])
-                self.reset_at = None
-                self.send_at = fallback
-                self.state = self.ARMED
-                self.log("log_limit_no_time", "warn", hard=hard,
-                         send=f"{fallback:%H:%M:%S}")
+                self.log("log_5h_hit", "warn", pct=pct,
+                         reset=(f"{reset:%a %H:%M}" if reset else "?"),
+                         send=f"{new_send:%H:%M:%S}")
                 self.emit("beep", None)
-                if self.cfg["keep_awake"]:
-                    keep_awake(True)
-                self.emit("state", self._state_info())
+            elif reset:
+                self.log("log_5h_reset_updated", reset=f"{reset:%a %H:%M}")
+            self.state = self.ARMED
+            if self.cfg["keep_awake"]:
+                keep_awake(True)
+            self.emit("state", self._state_info())
 
     # ------------------------------------------------------------------ sending
     @staticmethod
@@ -701,6 +811,26 @@ class MonitorWorker(threading.Thread):
             self.log("log_send_fail_nowin", "bad")
             self._after_send_failed()
             return
+
+        # Automatic send: confirm the 5-hour limit is really still hit before
+        # typing, so we never spam a session that already cleared.
+        if not manual:
+            threshold = self.cfg.get("limit_threshold_pct", 100)
+            rows, ok = self._read_usage_panel(win)
+            if ok:
+                self.last_rows = rows
+                pct = rows.get("5h", {}).get("pct")
+                if pct is not None and pct < threshold:
+                    self.log("log_5h_cleared", "good", pct=pct)
+                    self.emit("usage", {"rows": rows})
+                    self.retries = 0
+                    self.reset_at = self.send_at = None
+                    self.state = self.MONITORING
+                    if self.cfg["keep_awake"]:
+                        keep_awake(False)
+                    self.emit("state", self._state_info())
+                    return
+
         hwnd = self.hwnd
         try:
             self._focus_window(hwnd)
@@ -761,16 +891,22 @@ class MonitorWorker(threading.Thread):
             self.state = self.MONITORING
             self.emit("state", self._state_info())
             return
-        texts, _, _ = self._collect(win)
-        joined = "  ".join(texts)
-        hard = find_hard_limit(joined, self.cfg.get("extra_hard_patterns", ()))
-        if hard:
+        threshold = self.cfg.get("limit_threshold_pct", 100)
+        rows, ok = self._read_usage_panel(win)
+        if ok:
+            self.last_rows = rows
+            self.emit("usage", {"rows": rows})
+        h5 = rows.get("5h", {})
+        pct = h5.get("pct")
+        still_hit = ok and pct is not None and pct >= threshold
+
+        if still_hit:
             self.retries += 1
             if self.retries > self.cfg["max_retries"]:
                 self.log("log_still_done", "warn")
                 self.state = self.MONITORING
             else:
-                new_reset = parse_reset_time(joined)
+                new_reset = h5.get("reset")
                 if new_reset and new_reset > dt.datetime.now() + dt.timedelta(minutes=2):
                     self.reset_at = new_reset
                     self.send_at = new_reset + dt.timedelta(
@@ -784,6 +920,7 @@ class MonitorWorker(threading.Thread):
                              n=self.retries, max=self.cfg["max_retries"])
                 self.state = self.ARMED
         else:
+            # panel says < threshold (or unreadable) -> treat as resumed
             self.log("log_success", "good")
             self.retries = 0
             self.reset_at = self.send_at = None
@@ -1266,7 +1403,7 @@ class App(tk.Tk):
             self.cmb_windows.current(keep)
 
     def _render_usage(self):
-        u = self.usage
+        rows = self.usage.get("rows", {})
 
         def bar(canvas, fill_id, pct):
             width = canvas.winfo_width() or 90
@@ -1276,20 +1413,30 @@ class App(tk.Tk):
             canvas.coords(fill_id, 0, 0, int(width * frac), 5)
             canvas.itemconfigure(fill_id, fill=color)
 
-        if "used" in u:
-            self.lbl_used.config(text=self._T("usage_model", pct=u["used"]))
-            bar(self.bar_used, self.bar_used_fill, u["used"])
+        h5 = rows.get("5h", {})
+        wk = rows.get("weekly", {})
+        fb = rows.get("weekly_fable", {})
+
+        if "pct" in h5:
+            self.lbl_used.config(text=self._T("usage_5h", pct=h5["pct"]))
+            bar(self.bar_used, self.bar_used_fill, h5["pct"])
         else:
-            self.lbl_used.config(text=self._T("usage_model_none"))
-        if "plan" in u:
-            self.lbl_plan.config(text=self._T("usage_plan", pct=u["plan"]))
-            bar(self.bar_plan, self.bar_plan_fill, u["plan"])
+            self.lbl_used.config(text=self._T("usage_5h_none"))
+            self.bar_used.coords(self.bar_used_fill, 0, 0, 0, 5)
+
+        if "pct" in wk:
+            self.lbl_plan.config(text=self._T("usage_weekly", pct=wk["pct"]))
+            bar(self.bar_plan, self.bar_plan_fill, wk["pct"])
         else:
-            self.lbl_plan.config(text=self._T("usage_plan_none"))
-        if "reset" in u:
-            self.lbl_reset_seen.config(
-                text=self._T("usage_reset_seen",
-                             reset=f"{u['reset']:%a %d.%m %H:%M}"))
+            self.lbl_plan.config(text="")
+            self.bar_plan.coords(self.bar_plan_fill, 0, 0, 0, 5)
+
+        parts = []
+        if "pct" in fb:
+            parts.append(self._T("usage_fable", pct=fb["pct"]))
+        if "reset" in h5:
+            parts.append(self._T("usage_5h_reset", reset=f"{h5['reset']:%a %H:%M}"))
+        self.lbl_reset_seen.config(text="  ·  ".join(parts))
 
     def _render_state(self):
         st = self.state_info["state"]

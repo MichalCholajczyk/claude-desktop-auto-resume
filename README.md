@@ -23,12 +23,14 @@ toggle in the top-right corner (English by default).
 
 1. **Watches the Claude window** every ~20 seconds (it reads the interface the
    same way a screen reader does — no screenshots, no OCR).
-2. **Detects the limit message**, e.g. *"You've used 100% of your … limit"* or
-   *"5-hour limit reached"*.
-3. **Reads the reset time** from the banner (e.g. *"Resets Mon, Jul 13, 6:00 PM"*).
+2. **Checks the 5-hour limit specifically.** When the usage meter maxes out, it
+   briefly opens Claude's usage panel (the circular meter in the bottom bar) and
+   reads the **5-hour limit** row — ignoring the weekly and per-model limits, so
+   a maxed-out weekly (e.g. Fable) limit never triggers a false alarm.
+3. **Reads that limit's reset time** from the same panel (e.g. *"Resets in 45 min"*).
 4. **One minute after the reset** it brings the Claude window to the front,
-   clicks the chat box, types `continue` and sends. Then it checks whether the
-   limit actually cleared — if not, it retries.
+   clicks the chat box, types `continue` and sends. Then it re-checks the 5-hour
+   limit — if it's still maxed, it retries; if it cleared, it's done.
 
 While it waits for the reset, it also **keeps the PC from going to sleep**, so
 the overnight send actually happens.
@@ -102,6 +104,9 @@ it blank to fall back to `continue`.
 - **At send time the tool briefly takes over the keyboard** — it physically
   clicks and types into the Claude window. At night that's irrelevant; during
   the day, just don't be typing at that exact second.
+- **Leave the Claude window open and not minimized.** To read the 5-hour limit
+  the tool briefly opens Claude's usage panel by clicking the meter, then closes
+  it and puts your mouse cursor back — this needs the window visible.
 - **Leave the right conversation open** — the tool types into whatever session
   is currently showing in the Claude window.
 
@@ -123,8 +128,10 @@ Available in the app window; saved to `auto_continue_config.json`:
 | Send automatically | ✔ | turn off to only get an audible alert instead of sending |
 | Keep the PC awake | ✔ | blocks system and display sleep while watching |
 
-More advanced fields (number of retries, retry spacing, extra limit-message
-patterns) can be edited directly in `auto_continue_config.json` — see below.
+More advanced fields — number of retries, retry spacing, the 5-hour "hit"
+threshold (`limit_threshold_pct`, default 100), and how often the usage panel
+may be opened (`panel_backoff_s`) — can be edited directly in
+`auto_continue_config.json`.
 
 ---
 
@@ -133,14 +140,14 @@ patterns) can be edited directly in `auto_continue_config.json` — see below.
 **It can't see the Claude window.** Make sure Claude Desktop is actually running
 (not just in the tray) and click "Refresh".
 
-**It detected the limit but doesn't know the reset time.** Anthropic may have
-changed the wording. The tool will keep retrying anyway; you can also enter the
-time manually ("Arm"). To teach it a new message, add a pattern (a regular
-expression) to `extra_hard_patterns` in `auto_continue_config.json`, e.g.:
+**It keeps saying "couldn't read the usage panel".** The tool needs to click
+the usage meter in Claude's bottom bar, so the Claude window must be visible
+(not minimized) and reasonably sized. Bring the window up and it will recover on
+the next scan.
 
-```json
-{ "extra_hard_patterns": ["new\\s+limit\\s+wording"] }
-```
+**It's not reacting to a maxed weekly/Fable limit.** That's intentional — this
+tool only acts on the **5-hour limit**. A weekly or per-model limit at 100% does
+not block a normal session, so it's ignored.
 
 **Live view in the Log.** The "Log" panel (and the `auto_continue.log` file)
 show exactly what the tool sees and does — that's the first place to look when
@@ -163,12 +170,17 @@ external service, doesn't log conversation content, and takes no screenshots.
   Automation** (the `uiautomation` package). Chromium builds its accessibility
   tree only on demand, so the tool first "wakes" it by querying the documents'
   `TextPattern`.
-- **The conversation body and the sidebar are deliberately skipped** while
-  scanning — so talking *about* limits doesn't cause a false alarm.
+- **The 5-hour limit is read from Claude's own usage panel.** The bottom-bar
+  meter only shows the *highest* of all your limits, so a maxed weekly Fable
+  limit makes it read "100%" even when the 5-hour limit is fine. To disambiguate,
+  the tool clicks the meter to open the **Usage** popover and reads the specific
+  "5-hour limit" row (percentage + reset), then closes it with Escape and
+  restores the cursor. It only opens the popover when the cheap bottom-bar meter
+  is maxed, and backs off afterwards, to avoid flashing it constantly.
 - The chat box is a control named **Prompt**; clicking it focuses the field, then
   `SendKeys("continue{Enter}")` types the message.
-- State machine: `Watching → Limit (armed, send time known) → Send → Verify →
-  Watching` (or retry, if the limit is still active).
+- State machine: `Watching → 5-hour limit hit (armed, reset time known) → Send →
+  Verify → Watching` (or retry, if the 5-hour limit is still maxed).
 
 ---
 
