@@ -23,11 +23,17 @@ toggle in the top-right corner (English by default).
 
 1. **Watches the Claude window** every ~20 seconds (it reads the interface the
    same way a screen reader does — no screenshots, no OCR).
-2. **Checks the 5-hour limit specifically.** When the usage meter maxes out, it
-   briefly opens Claude's usage panel (the circular meter in the bottom bar) and
-   reads the **5-hour limit** row — ignoring the weekly and per-model limits, so
-   a maxed-out weekly (e.g. Fable) limit never triggers a false alarm.
-3. **Reads that limit's reset time** from the same panel (e.g. *"Resets in 45 min"*).
+2. **Looks for the "Usage limit reached" notice first.** That red strip next to
+   the chat box is Claude's own "session blocked" signal, so it's the primary
+   trigger — the usage meter can lag or stick below 100% while the session is
+   already blocked. The reset time is read straight from the notice
+   (e.g. *"Resets at 2:40 PM"*).
+3. **Falls back to the 5-hour limit meter.** When no notice is visible but the
+   usage meter maxes out, it briefly opens Claude's usage panel (the circular
+   meter in the bottom bar) and reads the **5-hour limit** row — ignoring the
+   weekly and per-model limits, so a maxed-out weekly (e.g. Fable) limit never
+   triggers a false alarm. The reset time comes from the same panel
+   (e.g. *"Resets in 45 min"*).
 4. **One minute after the reset** it brings the Claude window to the front,
    clicks the chat box, types `continue` and sends. Then it re-checks the 5-hour
    limit — if it's still maxed, it retries; if it cleared, it's done.

@@ -133,6 +133,7 @@ STRINGS = {
         "log_autosend_off": "Send time passed, but auto-send is OFF — alert only.",
         "log_window_refound": "Claude window found again (handle {hwnd}).",
         "log_5h_hit": "5-HOUR LIMIT HIT ({pct}%). Resets {reset}. I’ll send at {send}.",
+        "log_banner_hit": "“USAGE LIMIT REACHED” notice detected. Resets {reset}. I’ll send at {send}.",
         "log_5h_reset_updated": "5-hour reset updated: {reset}.",
         "log_5h_cleared": "5-hour limit is clear ({pct}%) — nothing to send, back to watching.",
         "log_panel_unreadable": "Couldn’t read the usage panel — will try again.",
@@ -194,6 +195,7 @@ STRINGS = {
         "log_autosend_off": "Czas wysyłki minął, ale auto-wysyłka jest WYŁĄCZONA — tylko alarm.",
         "log_window_refound": "Okno Claude odnalezione ponownie (uchwyt {hwnd}).",
         "log_5h_hit": "LIMIT 5-GODZINNY STRZELONY ({pct}%). Reset {reset}. Wyślę o {send}.",
+        "log_banner_hit": "Wykryto powiadomienie „USAGE LIMIT REACHED”. Reset {reset}. Wyślę o {send}.",
         "log_5h_reset_updated": "Zaktualizowano reset 5h: {reset}.",
         "log_5h_cleared": "Limit 5-godzinny wolny ({pct}%) — nie ma czego wysyłać, wracam do czuwania.",
         "log_panel_unreadable": "Nie udało się odczytać panelu zużycia — spróbuję ponownie.",
@@ -223,20 +225,19 @@ def tr(lang, key, **kw):
 
 # ------------------------------------------------------------------- detection
 
-# Phrases marking a HARD limit (session blocked) — not a mere warning.
-HARD_LIMIT_PATTERNS = [
-    r"you'?ve\s+reached\s+your",
-    r"limit\s+reached",
-    r"reached\s+(?:your\s+|the\s+)?(?:usage|session|5-hour|weekly)\s*limit",
+# The "Usage limit reached" notice Claude shows next to the chat box (and as a
+# notification card) while the session is hard-blocked. Unlike the usage-meter
+# percentages, which can go stale or read below 100% during a block, this text
+# is only rendered while the block is active — treat it as authoritative.
+# Patterns are deliberately narrow so meter/panel labels ("5-hour limit",
+# "Resets in 1 hr") can never match.
+BANNER_LIMIT_PATTERNS = [
+    r"usage\s+limit\s+reached",
+    r"you'?ve\s+reached\s+your\s+usage\s+limit",
     r"out\s+of\s+usage",
-    r"you'?re\s+out\s+of",
-    r"hit\s+(?:your|the)\s+.{0,30}?limit",
-    r"used\s+100\s*%",
-    r"100\s*%\s+of\s+your",
-    r"5-hour\s+limit",
-    r"plan\s+100\s*%",
+    r"osi[ąa]gni[ęe]to\s+limit",
+    r"limit\s+u[żz]ycia\s+(?:zosta[łl]\s+)?osi[ąa]gni[ęe]ty",
     r"limit\s+(?:zosta[łl]\s+)?osi[ąa]gni[ęe]ty",
-    r"osi[ąa]gn[ąą]?[łl](?:e[śs])?\s+.{0,30}?limit",
 ]
 
 # e.g. "Resets Mon, Jul 13, 6:00 PM" / "resets 3pm" / "resets at 6:30 PM"
@@ -312,16 +313,18 @@ def parse_reset_time(text, now=None):
     return None
 
 
-def find_hard_limit(text, extra_patterns=()):
-    """Return the matched hard-limit phrase, or None."""
-    for pat in list(HARD_LIMIT_PATTERNS) + list(extra_patterns):
-        try:
-            m = re.search(pat, text, re.IGNORECASE)
-        except re.error:
-            continue
-        if m:
-            return m.group(0)
-    return None
+def detect_limit_banner(texts, now=None):
+    """Scan control names (already filtered to outside-the-chat UI) for the
+    "Usage limit reached" notice. The reset time ("Resets at 2:40 PM") sits in
+    the same element or one of the next few, so parse a small window after the
+    match. Returns (matched_text, reset_datetime_or_None); (None, None) when
+    no banner is visible."""
+    for i, tx in enumerate(texts):
+        for pat in BANNER_LIMIT_PATTERNS:
+            if re.search(pat, tx, re.IGNORECASE):
+                window = "  ".join(texts[i:i + 4])
+                return tx.strip(), parse_reset_time(window, now=now)
+    return None, None
 
 # -------------------------------------------------------------- Windows layer
 
@@ -704,6 +707,11 @@ class MonitorWorker(threading.Thread):
         texts, _prompt, session = self._collect(win)
         joined = "  ".join(texts)
 
+        # Authoritative signal first: the "Usage limit reached" notice by the
+        # chat box. The meter/panel below can lag or stick below 100% while
+        # the session is already blocked, so the banner overrides them.
+        banner, banner_reset = detect_limit_banner(texts)
+
         # Cheap upper bound: the meter's "plan Y%" is the MAX across all limits,
         # so the 5-hour limit can only be maxed if this is maxed too. Only then
         # do we open the popover to check the 5-hour limit specifically.
@@ -713,7 +721,12 @@ class MonitorWorker(threading.Thread):
 
         rows = {}
         now = time.time()
-        need_panel = (plan_pct is None or plan_pct >= threshold)
+        # Open the popover when the meters say we might be limited, or when the
+        # banner is up but didn't carry a reset time (panel as reset fallback).
+        if banner is None:
+            need_panel = (plan_pct is None or plan_pct >= threshold)
+        else:
+            need_panel = banner_reset is None
         if need_panel and now >= self.next_panel_read:
             rows, ok = self._read_usage_panel(win)
             if ok:
@@ -737,10 +750,13 @@ class MonitorWorker(threading.Thread):
         pct = h5.get("pct")
         reset = h5.get("reset")
 
-        # Definitely not 5-hour-limited: plan meter below threshold, or panel
-        # says the 5-hour limit is below threshold.
-        limited = False
-        if plan_pct is not None and plan_pct < threshold:
+        if banner is not None:
+            # Session is blocked no matter what the meters claim.
+            limited = True
+            if banner_reset:
+                reset = banner_reset
+        elif plan_pct is not None and plan_pct < threshold:
+            # Definitely not 5-hour-limited: plan meter below threshold.
             limited = False
         elif pct is not None:
             limited = pct >= threshold
@@ -770,9 +786,14 @@ class MonitorWorker(threading.Thread):
             self.reset_at = reset
             self.send_at = new_send
             if self.state != self.ARMED:
-                self.log("log_5h_hit", "warn", pct=pct,
-                         reset=(f"{reset:%a %H:%M}" if reset else "?"),
-                         send=f"{new_send:%H:%M:%S}")
+                if banner is not None:
+                    self.log("log_banner_hit", "warn",
+                             reset=(f"{reset:%a %H:%M}" if reset else "?"),
+                             send=f"{new_send:%H:%M:%S}")
+                else:
+                    self.log("log_5h_hit", "warn", pct=pct,
+                             reset=(f"{reset:%a %H:%M}" if reset else "?"),
+                             send=f"{new_send:%H:%M:%S}")
                 self.emit("beep", None)
             elif reset:
                 self.log("log_5h_reset_updated", reset=f"{reset:%a %H:%M}")
@@ -813,14 +834,18 @@ class MonitorWorker(threading.Thread):
             return
 
         # Automatic send: confirm the 5-hour limit is really still hit before
-        # typing, so we never spam a session that already cleared.
+        # typing, so we never spam a session that already cleared. Trust a
+        # "clear" panel reading only while no limit banner is on screen — the
+        # panel has been seen reporting stale percentages during a block.
         if not manual:
             threshold = self.cfg.get("limit_threshold_pct", 100)
+            texts, _, _ = self._collect(win, budget_s=15.0)
+            banner, _ = detect_limit_banner(texts)
             rows, ok = self._read_usage_panel(win)
             if ok:
                 self.last_rows = rows
                 pct = rows.get("5h", {}).get("pct")
-                if pct is not None and pct < threshold:
+                if banner is None and pct is not None and pct < threshold:
                     self.log("log_5h_cleared", "good", pct=pct)
                     self.emit("usage", {"rows": rows})
                     self.retries = 0
@@ -892,13 +917,16 @@ class MonitorWorker(threading.Thread):
             self.emit("state", self._state_info())
             return
         threshold = self.cfg.get("limit_threshold_pct", 100)
+        texts, _, _ = self._collect(win, budget_s=15.0)
+        banner, banner_reset = detect_limit_banner(texts)
         rows, ok = self._read_usage_panel(win)
         if ok:
             self.last_rows = rows
             self.emit("usage", {"rows": rows})
         h5 = rows.get("5h", {})
         pct = h5.get("pct")
-        still_hit = ok and pct is not None and pct >= threshold
+        still_hit = banner is not None or \
+            (ok and pct is not None and pct >= threshold)
 
         if still_hit:
             self.retries += 1
@@ -906,7 +934,7 @@ class MonitorWorker(threading.Thread):
                 self.log("log_still_done", "warn")
                 self.state = self.MONITORING
             else:
-                new_reset = h5.get("reset")
+                new_reset = banner_reset or h5.get("reset")
                 if new_reset and new_reset > dt.datetime.now() + dt.timedelta(minutes=2):
                     self.reset_at = new_reset
                     self.send_at = new_reset + dt.timedelta(
