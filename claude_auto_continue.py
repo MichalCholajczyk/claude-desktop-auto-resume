@@ -605,16 +605,52 @@ class MonitorWorker(threading.Thread):
         return texts, prompt, session_title
 
     # -------------------------------------------------- usage panel (5h limit)
+    # The meter is a tiny round icon in the bottom bar; its Name is
+    # "Usage: context X%, plan Y%". Two OTHER controls also start with "Usage"
+    # and must never be clicked, or Claude Desktop navigates away and the app
+    # ends up typing "continue" into the wrong chat (the v0.21 session-switch
+    # bug): the "Usage limit reached" notice (a WIDE ButtonControl, often
+    # scrolled off-screen) and a session titled "Usage…" (a TextControl).
+    # We pick the meter by shape+place: a small ButtonControl in the bottom bar.
+    USAGE_METER_MAX_W = 80        # px — the meter icon; the notice is ~170 wide
+    USAGE_METER_BAND_FRAC = 0.15  # meter sits within this fraction of the bottom
+
+    @staticmethod
+    def _is_usage_meter(name, ctrl_type, rect, win_rect):
+        """True only for the bottom-bar usage meter (see note above)."""
+        if ctrl_type != "ButtonControl":
+            return False
+        if not (name or "").strip().lower().startswith("usage"):
+            return False
+        if win_rect is None or rect is None:
+            return False              # no geometry -> refuse to click blindly
+        win_h = win_rect.bottom - win_rect.top
+        if win_h <= 0:
+            return False
+        if (rect.right - rect.left) > MonitorWorker.USAGE_METER_MAX_W:
+            return False              # wide -> the "Usage limit reached" notice
+        band = max(120, int(MonitorWorker.USAGE_METER_BAND_FRAC * win_h))
+        center_y = (rect.top + rect.bottom) / 2
+        return center_y >= win_rect.bottom - band
+
     @staticmethod
     def _find_usage_button(win):
-        """The small round meter in the bottom bar; Name is 'Usage: ...'."""
+        """The small round meter in the bottom bar; Name is 'Usage: …%'."""
+        try:
+            win_rect = win.BoundingRectangle
+        except Exception:
+            win_rect = None
         for ctrl, _ in auto.WalkControl(win, includeTop=False, maxDepth=150):
             try:
-                if ctrl.ControlTypeName == "ButtonControl" and \
-                        (ctrl.Name or "").strip().lower().startswith("usage"):
-                    return ctrl
+                name = ctrl.Name or ""
+                if not name.strip().lower().startswith("usage"):
+                    continue
+                ct = ctrl.ControlTypeName
+                rect = ctrl.BoundingRectangle
             except Exception:
-                pass
+                continue
+            if MonitorWorker._is_usage_meter(name, ct, rect, win_rect):
+                return ctrl
         return None
 
     @staticmethod
