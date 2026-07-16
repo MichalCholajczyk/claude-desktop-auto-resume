@@ -47,6 +47,7 @@ DEFAULT_CONFIG = {
     "scan_interval_s": 20,          # how often to scan the window (seconds)
     "send_delay_after_reset_s": 60, # seconds after reset to send "continue"
     "message": "continue",          # what to type into the chat
+    "message_box_lines": 4,         # height of the message box, in text lines
     "auto_send": True,              # False = only alert, do not send
     "keep_awake": True,             # keep Windows from sleeping
     "max_retries": 6,               # retries while the limit is still active
@@ -113,6 +114,7 @@ STRINGS = {
         "chk_autosend": "Send automatically",
         "chk_awake": "Keep the PC awake",
         "lbl_message": "Message to send:",
+        "hint_message": "drag the handle to resize — line breaks become spaces",
         "lbl_know_reset": "Know the reset time?",
         "btn_arm": "Arm",
         "lbl_arm_hint": "format HH:MM — I’ll send a minute after that time",
@@ -135,7 +137,6 @@ STRINGS = {
         "log_5h_hit": "5-HOUR LIMIT HIT ({pct}%). Resets {reset}. I’ll send at {send}.",
         "log_banner_hit": "“USAGE LIMIT REACHED” notice detected. Resets {reset}. I’ll send at {send}.",
         "log_5h_reset_updated": "5-hour reset updated: {reset}.",
-        "log_5h_cleared": "5-hour limit is clear ({pct}%) — nothing to send, back to watching.",
         "log_panel_unreadable": "Couldn’t read the usage panel — will try again.",
         "log_send_fail_nowin": "SEND FAILED: no Claude window.",
         "log_send_abort_fg": "SEND ABORTED: Claude window isn’t in front (won’t type into another app).",
@@ -177,6 +178,7 @@ STRINGS = {
         "chk_autosend": "Wysyłaj automatycznie",
         "chk_awake": "Nie usypiaj komputera",
         "lbl_message": "Wysyłany tekst:",
+        "hint_message": "przeciągnij uchwyt, by zmienić rozmiar — złamania linii zamieniam na spacje",
         "lbl_know_reset": "Znasz godzinę resetu?",
         "btn_arm": "Uzbrój",
         "lbl_arm_hint": "format HH:MM — wyślę minutę po tej godzinie",
@@ -197,7 +199,6 @@ STRINGS = {
         "log_5h_hit": "LIMIT 5-GODZINNY STRZELONY ({pct}%). Reset {reset}. Wyślę o {send}.",
         "log_banner_hit": "Wykryto powiadomienie „USAGE LIMIT REACHED”. Reset {reset}. Wyślę o {send}.",
         "log_5h_reset_updated": "Zaktualizowano reset 5h: {reset}.",
-        "log_5h_cleared": "Limit 5-godzinny wolny ({pct}%) — nie ma czego wysyłać, wracam do czuwania.",
         "log_panel_unreadable": "Nie udało się odczytać panelu zużycia — spróbuję ponownie.",
         "log_send_fail_nowin": "WYSYŁKA NIEUDANA: brak okna Claude.",
         "log_send_abort_fg": "WYSYŁKA PRZERWANA: okno Claude nie jest na wierzchu (nie będę pisać do innej aplikacji).",
@@ -869,29 +870,14 @@ class MonitorWorker(threading.Thread):
             self._after_send_failed()
             return
 
-        # Automatic send: confirm the 5-hour limit is really still hit before
-        # typing, so we never spam a session that already cleared. Trust a
-        # "clear" panel reading only while no limit banner is on screen — the
-        # panel has been seen reporting stale percentages during a block.
-        if not manual:
-            threshold = self.cfg.get("limit_threshold_pct", 100)
-            texts, _, _ = self._collect(win, budget_s=15.0)
-            banner, _ = detect_limit_banner(texts)
-            rows, ok = self._read_usage_panel(win)
-            if ok:
-                self.last_rows = rows
-                pct = rows.get("5h", {}).get("pct")
-                if banner is None and pct is not None and pct < threshold:
-                    self.log("log_5h_cleared", "good", pct=pct)
-                    self.emit("usage", {"rows": rows})
-                    self.retries = 0
-                    self.reset_at = self.send_at = None
-                    self.state = self.MONITORING
-                    if self.cfg["keep_awake"]:
-                        keep_awake(False)
-                    self.emit("state", self._state_info())
-                    return
-
+        # Deliberately no "is the limit still hit?" check before typing. We arm
+        # for reset + send_delay_after_reset_s, so by the time we get here the
+        # 5-hour row reads 0% and the notice is gone — that IS the go-signal we
+        # waited for, not a reason to stay quiet. (Until v0.2137 this re-read the
+        # panel and aborted on a clear reading, which is why an automatic send
+        # only ever fired when the panel read happened to fail.) If a reset
+        # slips and the limit is still up, we type anyway and
+        # _verify_after_send() reschedules two minutes later.
         hwnd = self.hwnd
         try:
             self._focus_window(hwnd)
@@ -1051,8 +1037,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Claude Auto-Resume")
-        self.geometry("680x660")
-        self.minsize(620, 560)
+        self.geometry("680x780")
+        self.minsize(620, 660)
         self.configure(bg=THEME["bg"])
 
         self.cfg = load_config()
@@ -1264,14 +1250,39 @@ class App(tk.Tk):
 
         row_msg = tk.Frame(panel_in, bg=t["panel"])
         row_msg.pack(fill="x", pady=(0, 8))
-        self.lbl_message = tk.Label(row_msg, text="", bg=t["panel"],
+        row_msg_head = tk.Frame(row_msg, bg=t["panel"])
+        row_msg_head.pack(fill="x")
+        self.lbl_message = tk.Label(row_msg_head, text="", bg=t["panel"],
                                     fg=t["text"], font=(self.font_ui, 10))
         self.lbl_message.pack(side="left")
-        self.var_message = tk.StringVar(value=self.cfg.get("message", "continue"))
-        self.ent_message = ttk.Entry(row_msg, width=32, textvariable=self.var_message)
-        self.ent_message.pack(side="left", padx=8)
-        self.ent_message.bind("<FocusOut>", lambda _e: self._commit_message())
-        self.ent_message.bind("<Return>", lambda _e: self._commit_message())
+        self.lbl_msg_hint = tk.Label(row_msg_head, text="", bg=t["panel"],
+                                     fg=t["muted"], font=(self.font_ui, 9))
+        self.lbl_msg_hint.pack(side="left", padx=8)
+
+        msg_wrap = tk.Frame(row_msg, bg=t["border"])
+        msg_wrap.pack(fill="both", expand=True, pady=(4, 0))
+        self.txt_message = tk.Text(
+            msg_wrap, height=self._msg_lines(), wrap="word",
+            font=(self.font_ui, 10), bg=t["log_bg"], fg=t["text"],
+            insertbackground=t["text"], relief="flat", highlightthickness=0,
+            selectbackground=t["amber_dim"], padx=8, pady=6)
+        msg_scroll = ttk.Scrollbar(msg_wrap, orient="vertical",
+                                   command=self.txt_message.yview)
+        self.txt_message.configure(yscrollcommand=msg_scroll.set)
+        self.txt_message.pack(side="left", fill="both", expand=True,
+                              padx=(1, 0), pady=1)
+        msg_scroll.pack(side="right", fill="y", pady=1, padx=(0, 1))
+        self.txt_message.insert("1.0", self.cfg.get("message", "continue"))
+        self.txt_message.bind("<FocusOut>", lambda _e: self._commit_message())
+
+        self.grip_msg = tk.Canvas(row_msg, height=9, bg=t["panel"],
+                                  highlightthickness=0,
+                                  cursor="sb_v_double_arrow")
+        self.grip_msg.pack(fill="x")
+        self.grip_msg.bind("<Configure>", lambda _e: self._draw_grip())
+        self.grip_msg.bind("<Button-1>", self._on_grip_press)
+        self.grip_msg.bind("<B1-Motion>", self._on_grip_drag)
+        self.grip_msg.bind("<ButtonRelease-1>", lambda _e: self._on_grip_release())
 
         row_manual = tk.Frame(panel_in, bg=t["panel"])
         row_manual.pack(fill="x")
@@ -1343,6 +1354,7 @@ class App(tk.Tk):
         self.chk_autosend.config(text=self._T("chk_autosend"))
         self.chk_awake.config(text=self._T("chk_awake"))
         self.lbl_message.config(text=self._T("lbl_message"))
+        self.lbl_msg_hint.config(text=self._T("hint_message"))
         self.lbl_know_reset.config(text=self._T("lbl_know_reset"))
         self.btn_arm.config(text=self._T("btn_arm"))
         self.lbl_arm_hint.config(text=self._T("lbl_arm_hint"))
@@ -1386,12 +1398,54 @@ class App(tk.Tk):
         self._push_config()
         self.worker.command("arm_manual", t)
 
+    # ------------------------------------------------------------ message box
+    MSG_LINES_MIN, MSG_LINES_MAX = 2, 20
+
+    def _msg_lines(self):
+        try:
+            n = int(self.cfg.get("message_box_lines", 4))
+        except (TypeError, ValueError):
+            n = 4
+        return max(self.MSG_LINES_MIN, min(self.MSG_LINES_MAX, n))
+
+    def _draw_grip(self):
+        self.grip_msg.delete("all")
+        x = self.grip_msg.winfo_width() // 2
+        for y in (3, 6):
+            self.grip_msg.create_line(x - 16, y, x + 16, y,
+                                      fill=THEME["muted"], width=1)
+
+    def _on_grip_press(self, e):
+        import tkinter.font as tkfont
+        lh = tkfont.Font(font=self.txt_message.cget("font")).metrics("linespace")
+        self._grip_origin = (e.y_root, int(self.txt_message.cget("height")),
+                             max(1, lh))
+
+    def _on_grip_drag(self, e):
+        if not getattr(self, "_grip_origin", None):
+            return
+        y0, lines0, lh = self._grip_origin
+        n = lines0 + int(round((e.y_root - y0) / lh))
+        n = max(self.MSG_LINES_MIN, min(self.MSG_LINES_MAX, n))
+        if n != int(self.txt_message.cget("height")):
+            self.txt_message.configure(height=n)
+
+    def _on_grip_release(self):
+        self._grip_origin = None
+        self.cfg["message_box_lines"] = int(self.txt_message.cget("height"))
+        save_config(self.cfg)
+
+    def _message_text(self):
+        """Box content as a single line. Enter sends in Claude's composer, so a
+        line break inside the message would submit it half-written."""
+        return " ".join(self.txt_message.get("1.0", "end-1c").split()) or "continue"
+
     def _commit_message(self):
         """Save the custom message; fall back to 'continue' when left blank."""
-        msg = self.var_message.get().strip()
-        if not msg:
-            msg = "continue"
-            self.var_message.set(msg)
+        msg = self._message_text()
+        if msg != self.txt_message.get("1.0", "end-1c"):
+            self.txt_message.delete("1.0", "end")
+            self.txt_message.insert("1.0", msg)
         self._push_config()
 
     def _push_config(self):
@@ -1399,7 +1453,7 @@ class App(tk.Tk):
             interval = max(5, int(self.var_interval.get()))
         except (tk.TclError, ValueError):
             interval = DEFAULT_CONFIG["scan_interval_s"]
-        message = self.var_message.get().strip() or "continue"
+        message = self._message_text()
         payload = {
             "scan_interval_s": interval,
             "auto_send": bool(self.var_autosend.get()),

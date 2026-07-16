@@ -94,9 +94,15 @@ shows how much waiting is left.
 ### Custom message
 
 By default the tool sends **`continue`**, but you can send anything you like.
-Type your own text into the **"Message to send"** field — that exact text is
+Type your own text into the **"Message to send"** box — that exact text is
 what gets sent when the limit resets (and by the "Send now" button too). Leave
 it blank to fall back to `continue`.
+
+The box takes long prompts: it wraps and scrolls, and you can drag the handle
+underneath it to make it taller (the height is remembered between runs). What
+you type is sent as **one message**, so line breaks are collapsed into spaces —
+Enter submits in Claude's composer, so a line break inside the message would
+send it half-written.
 
 ---
 
