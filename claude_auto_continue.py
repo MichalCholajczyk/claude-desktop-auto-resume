@@ -23,6 +23,8 @@ import threading
 import time
 import tkinter as tk
 from tkinter import messagebox, ttk
+sys.modules.setdefault("claude_auto_continue", sys.modules[__name__])
+from session_automation import SessionEngine
 
 try:
     import uiautomation as auto
@@ -50,6 +52,13 @@ DEFAULT_CONFIG = {
     "message_box_lines": 4,         # height of the message box, in text lines
     "auto_send": True,              # False = only alert, do not send
     "keep_awake": True,             # keep Windows from sleeping
+    "watch_scope": "open",          # open panes or explicitly selected chats
+    "selected_chats": [],
+    "prefer_try_again": False,
+    "retry_api_errors": True,
+    "auto_approach": False,
+    "api_retry_wait_s": 30,
+    "verify_delay_s": 30,
     "max_retries": 6,               # retries while the limit is still active
     "retry_wait_s": 600,            # retry spacing when reset time is unknown
     "limit_threshold_pct": 100,     # 5-hour limit % that counts as "hit"
@@ -63,10 +72,22 @@ def load_config():
     try:
         with open(CONFIG_PATH, "r", encoding="utf-8") as f:
             cfg.update(json.load(f))
-    except (OSError, ValueError):
+    except (OSError, ValueError, TypeError):
         pass
     if cfg.get("language") not in ("en", "pl"):
         cfg["language"] = "en"
+    if cfg.get("watch_scope") not in ("open", "selected"):
+        cfg["watch_scope"] = "open"
+    selected = cfg.get("selected_chats")
+    cfg["selected_chats"] = list(dict.fromkeys(k for k in selected if isinstance(k, str) and
+        k.startswith(("code:", "chat:")))) if isinstance(selected, list) else []
+    for field, minimum, maximum in (("scan_interval_s", 5, 300), ("api_retry_wait_s", 5, 900),
+                                    ("max_retries", 1, 20), ("retry_wait_s", 30, 86400),
+                                    ("verify_delay_s", 5, 300), ("send_delay_after_reset_s", 0, 3600)):
+        try:
+            cfg[field] = min(maximum, max(minimum, int(cfg[field])))
+        except (TypeError, ValueError):
+            cfg[field] = DEFAULT_CONFIG[field]
     return cfg
 
 
@@ -214,6 +235,60 @@ STRINGS = {
 }
 
 
+STRINGS["en"].update({
+    "scope_open": "All open conversation panes",
+    "scope_selected": "Only checked conversations",
+    "chats_refresh": "Read chats",
+    "chats_hint": "Check a row to watch it. Open older chats in Claude, then read the list again.",
+    "chats_empty": "Read chats to see open panes and the loaded sidebar conversations.",
+    "col_watch": "Watch", "col_chat": "Conversation", "col_source": "Source", "col_status": "Status / next attempt",
+    "prefer_try_again": "Prefer “Try again” after a limit reset",
+    "retry_api_errors": "Retry API and server errors",
+    "auto_approach": "Answer approach questions automatically",
+    "approach_hint": "Selects recommended options; otherwise asks Claude to choose in Other.",
+    "log_chat_action": "{chat}: {action}",
+    "btn_send_now": "Resume now…", "dlg_send_body": "Resume all conversations in the chosen scope now? Existing drafts and busy sessions will be skipped.",
+    "state_monitoring": "Watching conversations", "state_armed": "Waiting for the next attempt",
+    "cap_armed_noreset": "Next attempt at {send}. See each conversation’s status below.",
+    "cap_armed_reset": "Reset {reset} — next attempt at {send}.",
+    "watching": "Watching", "waiting": "Waiting", "verifying": "Checking", "exhausted": "Needs attention",
+    "sidebar": "Sidebar", "open": "Open pane", "unavailable": "Unavailable — open it in Claude",
+    "waiting_limit": "Usage limit — waiting for reset", "waiting_api": "Server error — retry scheduled",
+    "approach_submitted": "Recommended approach submitted", "resumed": "Block cleared",
+    "permanent_error": "Account / access error — manual action required", "retry_limit": "Retry limit reached — stop/start to rearm",
+    "alert_only": "Alert only — automatic sending is off", "retry": "Clicked Try again", "message": "Sent configured message",
+    "cleared": "Error cleared", "busy": "Claude is already working",
+    "inactive": "Not watching", "not_visible": "Not currently loaded",
+    "question": "Awaiting an answer",
+})
+STRINGS["pl"].update({
+    "scope_open": "Wszystkie otwarte panele rozmów",
+    "scope_selected": "Tylko zaznaczone rozmowy",
+    "chats_refresh": "Odczytaj czaty",
+    "chats_hint": "Zaznacz rozmowy do pilnowania. Starszy czat otwórz w Claude i odczytaj listę ponownie.",
+    "chats_empty": "Odczytaj czaty, aby zobaczyć otwarte panele i rozmowy z paska bocznego.",
+    "col_watch": "Pilnuj", "col_chat": "Rozmowa", "col_source": "Źródło", "col_status": "Stan / następna próba",
+    "prefer_try_again": "Preferuj „Try again” po resecie limitu",
+    "retry_api_errors": "Ponawiaj błędy API i serwera",
+    "auto_approach": "Automatycznie odpowiadaj na pytania o podejście",
+    "approach_hint": "Wybiera rekomendacje, a przy ich braku prosi Claude o wybór w polu Other.",
+    "log_chat_action": "{chat}: {action}",
+    "btn_send_now": "Wznów teraz…", "dlg_send_body": "Wznowić teraz wszystkie rozmowy z wybranego zakresu? Szkice i pracujące sesje zostaną pominięte.",
+    "state_monitoring": "Czuwam nad rozmowami", "state_armed": "Czekam na następną próbę",
+    "cap_armed_noreset": "Następna próba o {send}. Stan poszczególnych rozmów znajdziesz na liście.",
+    "cap_armed_reset": "Reset {reset} — następna próba o {send}.",
+    "watching": "Czuwanie", "waiting": "Oczekiwanie", "verifying": "Sprawdzanie", "exhausted": "Wymaga uwagi",
+    "sidebar": "Pasek boczny", "open": "Otwarty panel", "unavailable": "Niedostępna — otwórz w Claude",
+    "waiting_limit": "Limit użycia — czekam na reset", "waiting_api": "Błąd serwera — zaplanowano próbę",
+    "approach_submitted": "Wysłano rekomendowane podejście", "resumed": "Blokada ustąpiła",
+    "permanent_error": "Błąd konta / dostępu — potrzebne działanie użytkownika", "retry_limit": "Wyczerpano próby — zatrzymaj i uruchom czuwanie ponownie",
+    "alert_only": "Tylko alarm — automatyczna wysyłka wyłączona", "retry": "Kliknięto Try again", "message": "Wysłano ustawioną wiadomość",
+    "cleared": "Błąd ustąpił", "busy": "Claude już pracuje",
+    "inactive": "Czuwanie wyłączone", "not_visible": "Obecnie niewczytana",
+    "question": "Czeka na odpowiedź",
+})
+
+
 def tr(lang, key, **kw):
     """Translate a key; fall back to English, then to the raw key."""
     template = STRINGS.get(lang, STRINGS["en"]).get(key)
@@ -258,16 +333,12 @@ RE_RESET_REL = re.compile(
     r"(?:(\d+)\s*(?:minut\w*|min(?:ute)?s?|m)\.?)?",
     re.IGNORECASE)
 
-RE_USED_PCT = re.compile(r"used\s+(\d{1,3})\s*%", re.IGNORECASE)
-RE_PLAN_PCT = re.compile(r"plan\s+(\d{1,3})\s*%", re.IGNORECASE)
 
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
           "sty": 1, "lut": 2, "kwi": 4, "maj": 5, "cze": 6,
           "lip": 7, "sie": 8, "wrz": 9, "paź": 10, "lis": 11, "gru": 12}
 
-# UI groups whose contents we ignore (so chatting *about* limits won't false-trigger)
-EXCLUDED_GROUPS = {"chat messages", "sidebar", "recents"}
 
 
 def parse_reset_time(text, now=None):
@@ -372,25 +443,20 @@ class MonitorWorker(threading.Thread):
         super().__init__(daemon=True)
         self.out = out_queue          # (kind, data) -> UI
         self.cmds = queue.Queue()     # commands from UI
-        self.cfg = cfg
+        self.cfg = dict(cfg)
         self.state = self.IDLE
         self.hwnd = None
         self.reset_at = None
         self.send_at = None
-        self.verify_at = None
-        self.retries = 0
-        self.next_scan = 0.0
-        self.next_panel_read = 0.0    # throttle for opening the usage popover
-        self.panel_fail = 0
-        self.last_rows = {}           # last usage-panel reading
-        self._stop = threading.Event()
+        self._stop_event = threading.Event()
+        self.engine = SessionEngine(self)
 
     # --- API for the UI thread (thread-safe) ---
     def command(self, name, payload=None):
         self.cmds.put((name, payload))
 
     def shutdown(self):
-        self._stop.set()
+        self._stop_event.set()
 
     # --- messages to the UI ---
     def emit(self, kind, data=None):
@@ -413,7 +479,7 @@ class MonitorWorker(threading.Thread):
     def run(self):
         with auto.UIAutomationInitializerInThread():
             auto.SetGlobalSearchTimeout(3)
-            while not self._stop.is_set():
+            while not self._stop_event.is_set():
                 try:
                     self._process_commands()
                     self._tick()
@@ -430,9 +496,31 @@ class MonitorWorker(threading.Thread):
             except queue.Empty:
                 return
             if name == "refresh_windows":
-                self.emit("windows", self._enum_windows())
+                wins = self._enum_windows()
+                if self.hwnd not in {hwnd for hwnd, _ in wins}:
+                    self.hwnd = wins[0][0] if wins else None
+                    self.engine.reset()
+                    self.engine.catalog.clear()
+                self.emit("windows", wins)
+                if wins:
+                    try:
+                        self.engine.refresh()
+                    except Exception as exc:
+                        self.log("log_monitor_error", "warn", err=str(exc))
+                else:
+                    self.emit("chats", [])
+                    self.emit("status", "no_window")
+            elif name == "refresh_chats":
+                try:
+                    self.engine.refresh()
+                except Exception as exc:
+                    self.log("log_monitor_error", "warn", err=str(exc))
             elif name == "select_window":
-                self.hwnd = payload
+                if self.hwnd != payload:
+                    self.engine.reset()
+                    self.engine.catalog.clear()
+                    self.hwnd = payload
+                    self.engine.refresh()
             elif name == "start":
                 if not self.hwnd:
                     wins = self._enum_windows()
@@ -443,60 +531,54 @@ class MonitorWorker(threading.Thread):
                     self.log("log_no_window_start", "warn")
                     continue
                 self.state = self.MONITORING
-                self.retries = 0
-                self.next_scan = 0.0
+                self.engine.reset()
                 if self.cfg["keep_awake"]:
                     keep_awake(False)
                 self.log("log_started")
                 self.emit("state", self._state_info())
             elif name == "stop":
                 self.state = self.IDLE
+                self.engine.reset()
                 self.reset_at = self.send_at = None
                 allow_sleep()
                 self.log("log_stopped")
                 self.emit("state", self._state_info())
             elif name == "send_now":
                 self.log("log_manual_send")
-                self._do_send(manual=True)
+                panes = self.engine.refresh()
+                for key in self.engine.targets(panes):
+                    if not self.cmds.empty() or self._stop_event.is_set():
+                        break
+                    try:
+                        result = self.engine.ui.resume(key, self.cfg.get("prefer_try_again"))
+                        from session_automation import SessionState
+                        self.engine.sessions[key] = SessionState(
+                            phase="watching" if result in ("busy", "cleared") else "verifying",
+                            reason="limit", due=dt.datetime.now() + dt.timedelta(seconds=self.cfg["verify_delay_s"]))
+                        self.log("log_chat_action", chat=key.split(":", 1)[-1], action=self.t(result))
+                    except Exception as exc:
+                        self.log("log_chat_action", "warn", chat=key.split(":", 1)[-1], action=str(exc))
             elif name == "arm_manual":
-                self.reset_at = payload
-                self.send_at = payload + dt.timedelta(seconds=self.cfg["send_delay_after_reset_s"])
-                self.state = self.ARMED
-                self.retries = 0
-                if self.cfg["keep_awake"]:
-                    keep_awake(True)
-                self.log("log_armed_manual",
-                         reset=f"{payload:%Y-%m-%d %H:%M}",
-                         send=f"{self.send_at:%H:%M:%S}")
-                self.emit("state", self._state_info())
+                self.state = self.MONITORING
+                self.engine.arm(payload)
             elif name == "config":
                 self.cfg.update(payload)
+                self.engine.next_scan = 0
 
     def _tick(self):
-        now = time.time()
-        if self.state == self.MONITORING:
-            if now >= self.next_scan:
-                self.next_scan = now + self.cfg["scan_interval_s"]
-                self._scan_and_decide()
-        elif self.state == self.ARMED:
-            # We already know the 5-hour reset time, so just wait for it — no
-            # need to keep opening the usage popover (it would flash all night).
-            if dt.datetime.now() >= self.send_at:
-                if self.cfg["auto_send"]:
-                    self._do_send()
-                else:
-                    self.log("log_autosend_off", "warn")
-                    self.emit("beep", None)
-                    self.state = self.MONITORING
-                    self.emit("state", self._state_info())
-            self.emit("countdown", self._state_info())
-        elif self.state == self.VERIFY:
-            if dt.datetime.now() >= self.verify_at:
-                self._verify_after_send()
+        if self.state != self.IDLE:
+            if self.cfg["keep_awake"]:
+                keep_awake(True)
+            else:
+                allow_sleep()
+            self.engine.tick()
 
     # ---------------------------------------------------------------- scanning
     def _get_window(self):
         if not self.hwnd or not user32.IsWindow(self.hwnd):
+            if self.hwnd:
+                # Don't migrate armed conversations to a different window.
+                return None
             wins = self._enum_windows()
             if wins:
                 self.hwnd = wins[0][0]
@@ -545,65 +627,6 @@ class MonitorWorker(threading.Thread):
                         pass
         except Exception:
             pass
-
-    def _collect(self, win, budget_s=30.0):
-        """Return (texts_outside_chat, prompt_control, session_title)."""
-        self._wake_accessibility(win)
-        time.sleep(0.7)
-
-        texts = []
-        prompt = None
-        session_title = None
-        exclude_depth = None
-        t0 = time.time()
-        count = 0
-        try:
-            win_rect = win.BoundingRectangle
-        except Exception:
-            win_rect = None
-
-        for ctrl, depth in auto.WalkControl(win, includeTop=False, maxDepth=150):
-            count += 1
-            if count > 30000 or time.time() - t0 > budget_s:
-                break
-            try:
-                name = ctrl.Name or ""
-                ct = ctrl.ControlTypeName
-            except Exception:
-                continue
-
-            if exclude_depth is not None:
-                if depth > exclude_depth:
-                    continue        # inside an excluded group (chat/sidebar)
-                exclude_depth = None
-            if ct == "GroupControl" and name.strip().lower() in EXCLUDED_GROUPS:
-                exclude_depth = depth
-                continue
-
-            if name.strip():
-                texts.append(name)
-
-            if prompt is None and name.strip().lower() == "prompt":
-                prompt = ctrl
-            if prompt is None and ct == "EditControl" and win_rect:
-                try:
-                    r = ctrl.BoundingRectangle
-                    if r.bottom > win_rect.bottom - int(0.35 * win_rect.height()):
-                        prompt = ctrl
-                except Exception:
-                    pass
-
-            # best guess at the active session title: text in the top bar
-            if session_title is None and win_rect and ct in ("ButtonControl", "TextControl"):
-                try:
-                    r = ctrl.BoundingRectangle
-                    if 30 < r.top < 90 and (r.right - r.left) > 120 and name.strip() and \
-                            name.strip().lower() not in ("search", "menu", "back", "forward"):
-                        session_title = name.strip()
-                except Exception:
-                    pass
-
-        return texts, prompt, session_title
 
     # -------------------------------------------------- usage panel (5h limit)
     # The meter is a tiny round icon in the bottom bar; its Name is
@@ -702,16 +725,21 @@ class MonitorWorker(threading.Thread):
                         rows[cur]["reset"] = rt
         return rows
 
-    def _read_usage_panel(self, win):
+    def _read_usage_panel(self, win, meter_scope=None):
         """Open the usage popover, read the per-limit rows, close it and restore
         the mouse cursor. Returns (rows, ok)."""
-        btn = self._find_usage_button(win)
+        btn = self._find_usage_button(meter_scope if meter_scope is not None else win)
         if not btn:
+            return {}, False
+        self._focus_window(self.hwnd)
+        if user32.GetForegroundWindow() != self.hwnd or not self.cmds.empty() or self._stop_event.is_set():
             return {}, False
         pt = ctypes.wintypes.POINT()
         user32.GetCursorPos(ctypes.byref(pt))
         m0 = (pt.x, pt.y)
         try:
+            if btn.IsOffscreen or not btn.IsEnabled:
+                return {}, False
             btn.Click(simulateMove=False)
         except Exception:
             return {}, False
@@ -726,7 +754,8 @@ class MonitorWorker(threading.Thread):
         except Exception:
             ok = False
         try:
-            auto.SendKeys("{Esc}", waitTime=0.05)
+            if user32.GetForegroundWindow() == self.hwnd:
+                auto.SendKeys("{Esc}", waitTime=0.05)
         except Exception:
             pass
         time.sleep(0.35)
@@ -735,109 +764,6 @@ class MonitorWorker(threading.Thread):
         except Exception:
             pass
         return rows, ok
-
-    def _scan_and_decide(self, refresh_only=False):
-        win = self._get_window()
-        if not win:
-            self.emit("status", "no_window")
-            return
-        texts, _prompt, session = self._collect(win)
-        joined = "  ".join(texts)
-
-        # Authoritative signal first: the "Usage limit reached" notice by the
-        # chat box. The meter/panel below can lag or stick below 100% while
-        # the session is already blocked, so the banner overrides them.
-        banner, banner_reset = detect_limit_banner(texts)
-
-        # Cheap upper bound: the meter's "plan Y%" is the MAX across all limits,
-        # so the 5-hour limit can only be maxed if this is maxed too. Only then
-        # do we open the popover to check the 5-hour limit specifically.
-        m = RE_PLAN_PCT.search(joined)
-        plan_pct = int(m.group(1)) if m else None
-        threshold = self.cfg.get("limit_threshold_pct", 100)
-
-        rows = {}
-        now = time.time()
-        # Open the popover when the meters say we might be limited, or when the
-        # banner is up but didn't carry a reset time (panel as reset fallback).
-        if banner is None:
-            need_panel = (plan_pct is None or plan_pct >= threshold)
-        else:
-            need_panel = banner_reset is None
-        if need_panel and now >= self.next_panel_read:
-            rows, ok = self._read_usage_panel(win)
-            if ok:
-                self.panel_fail = 0
-                self.last_rows = rows
-            else:
-                self.panel_fail += 1
-                if self.panel_fail in (1, 5, 20):
-                    self.log("log_panel_unreadable", "warn")
-
-        info = {}
-        if plan_pct is not None:
-            info["plan"] = plan_pct
-        if self.last_rows:
-            info["rows"] = self.last_rows
-        if session:
-            info["session"] = session
-        self.emit("usage", info)
-
-        h5 = (rows or self.last_rows).get("5h", {}) if (rows or self.last_rows) else {}
-        pct = h5.get("pct")
-        reset = h5.get("reset")
-
-        if banner is not None:
-            # Session is blocked no matter what the meters claim.
-            limited = True
-            if banner_reset:
-                reset = banner_reset
-        elif plan_pct is not None and plan_pct < threshold:
-            # Definitely not 5-hour-limited: plan meter below threshold.
-            limited = False
-        elif pct is not None:
-            limited = pct >= threshold
-        else:
-            # couldn't read the 5-hour figure and plan is maxed -> back off,
-            # stay cautious (do not arm on an unknown).
-            self.next_panel_read = now + self.cfg.get("panel_backoff_s", 300)
-            if self.state == self.MONITORING:
-                self.emit("status", "ok")
-            return
-
-        if not limited:
-            # while plan stays maxed by a weekly limit, stop re-opening for a while
-            if plan_pct is not None and plan_pct >= threshold:
-                self.next_panel_read = now + self.cfg.get("panel_backoff_s", 300)
-            if self.state == self.MONITORING:
-                self.emit("status", "ok")
-            return
-
-        # 5-hour limit is genuinely hit
-        if reset:
-            new_send = reset + dt.timedelta(seconds=self.cfg["send_delay_after_reset_s"])
-        else:
-            new_send = dt.datetime.now() + dt.timedelta(seconds=self.cfg["retry_wait_s"])
-        if self.state != self.ARMED or self.send_at is None or \
-                abs((new_send - self.send_at).total_seconds()) > 90:
-            self.reset_at = reset
-            self.send_at = new_send
-            if self.state != self.ARMED:
-                if banner is not None:
-                    self.log("log_banner_hit", "warn",
-                             reset=(f"{reset:%a %H:%M}" if reset else "?"),
-                             send=f"{new_send:%H:%M:%S}")
-                else:
-                    self.log("log_5h_hit", "warn", pct=pct,
-                             reset=(f"{reset:%a %H:%M}" if reset else "?"),
-                             send=f"{new_send:%H:%M:%S}")
-                self.emit("beep", None)
-            elif reset:
-                self.log("log_5h_reset_updated", reset=f"{reset:%a %H:%M}")
-            self.state = self.ARMED
-            if self.cfg["keep_awake"]:
-                keep_awake(True)
-            self.emit("state", self._state_info())
 
     # ------------------------------------------------------------------ sending
     @staticmethod
@@ -859,125 +785,24 @@ class MonitorWorker(threading.Thread):
         if user32.IsIconic(hwnd):
             user32.ShowWindow(hwnd, SW_RESTORE)
             time.sleep(0.6)
-        user32.SwitchToThisWindow(hwnd, True)
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.5)
-
-    def _do_send(self, manual=False):
-        win = self._get_window()
-        if not win:
-            self.log("log_send_fail_nowin", "bad")
-            self._after_send_failed()
-            return
-
-        # Deliberately no "is the limit still hit?" check before typing. We arm
-        # for reset + send_delay_after_reset_s, so by the time we get here the
-        # 5-hour row reads 0% and the notice is gone — that IS the go-signal we
-        # waited for, not a reason to stay quiet. (Until v0.2137 this re-read the
-        # panel and aborted on a clear reading, which is why an automatic send
-        # only ever fired when the panel read happened to fail.) If a reset
-        # slips and the limit is still up, we type anyway and
-        # _verify_after_send() reschedules two minutes later.
-        hwnd = self.hwnd
+        # A monitor thread has no foreground activation rights after the user
+        # interacts with Auto-Resume. Temporarily join the foreground input
+        # queue; always detach, even if activation fails. No synthetic Alt key
+        # (which could operate a menu in an unrelated application).
+        current = kernel32.GetCurrentThreadId()
+        foreground = user32.GetWindowThreadProcessId(user32.GetForegroundWindow(), None)
+        target = user32.GetWindowThreadProcessId(hwnd, None)
+        attached = []
         try:
-            self._focus_window(hwnd)
-            texts, prompt, _ = self._collect(win, budget_s=15.0)
-
-            if prompt is not None:
-                try:
-                    prompt.Click(simulateMove=False)
-                except Exception:
-                    prompt = None
-            if prompt is None:
-                # fallback: click just above the bottom button bar, window center
-                r = win.BoundingRectangle
-                auto.Click(int((r.left + r.right) / 2), int(r.bottom - 80))
-            time.sleep(0.6)
-
-            if user32.GetForegroundWindow() != hwnd:
-                self._focus_window(hwnd)
-                time.sleep(0.4)
-            if user32.GetForegroundWindow() != hwnd:
-                self.log("log_send_abort_fg", "bad")
-                self._after_send_failed()
-                return
-
-            message = self.cfg.get("message") or "continue"
-            auto.SendKeys(self._escape_sendkeys(message), interval=0.03, waitTime=0.2)
-            time.sleep(0.3)
-            auto.SendKeys("{Enter}", waitTime=0.2)
-            self.log("log_sent", "good", message=message)
-            self.emit("beep", None)
-        except Exception as e:
-            self.log("log_send_fail", "bad", err=repr(e))
-            self._after_send_failed()
-            return
-
-        if manual and self.state not in (self.ARMED, self.VERIFY):
-            return
-        self.state = self.VERIFY
-        self.verify_at = dt.datetime.now() + dt.timedelta(seconds=120)
-        self.emit("state", self._state_info())
-
-    def _after_send_failed(self):
-        if self.state in (self.ARMED, self.VERIFY):
-            self.retries += 1
-            if self.retries > self.cfg["max_retries"]:
-                self.log("log_retries_done", "warn")
-                self.state = self.MONITORING
-            else:
-                self.send_at = dt.datetime.now() + dt.timedelta(seconds=300)
-                self.state = self.ARMED
-                self.log("log_retry_at", send=f"{self.send_at:%H:%M:%S}",
-                         n=self.retries, max=self.cfg["max_retries"])
-            self.emit("state", self._state_info())
-
-    def _verify_after_send(self):
-        win = self._get_window()
-        if not win:
-            self.state = self.MONITORING
-            self.emit("state", self._state_info())
-            return
-        threshold = self.cfg.get("limit_threshold_pct", 100)
-        texts, _, _ = self._collect(win, budget_s=15.0)
-        banner, banner_reset = detect_limit_banner(texts)
-        rows, ok = self._read_usage_panel(win)
-        if ok:
-            self.last_rows = rows
-            self.emit("usage", {"rows": rows})
-        h5 = rows.get("5h", {})
-        pct = h5.get("pct")
-        still_hit = banner is not None or \
-            (ok and pct is not None and pct >= threshold)
-
-        if still_hit:
-            self.retries += 1
-            if self.retries > self.cfg["max_retries"]:
-                self.log("log_still_done", "warn")
-                self.state = self.MONITORING
-            else:
-                new_reset = banner_reset or h5.get("reset")
-                if new_reset and new_reset > dt.datetime.now() + dt.timedelta(minutes=2):
-                    self.reset_at = new_reset
-                    self.send_at = new_reset + dt.timedelta(
-                        seconds=self.cfg["send_delay_after_reset_s"])
-                    self.log("log_still_new", reset=f"{new_reset:%a %H:%M}",
-                             send=f"{self.send_at:%H:%M:%S}")
-                else:
-                    self.send_at = dt.datetime.now() + dt.timedelta(
-                        seconds=self.cfg["retry_wait_s"])
-                    self.log("log_still_retry", send=f"{self.send_at:%H:%M:%S}",
-                             n=self.retries, max=self.cfg["max_retries"])
-                self.state = self.ARMED
-        else:
-            # panel says < threshold (or unreadable) -> treat as resumed
-            self.log("log_success", "good")
-            self.retries = 0
-            self.reset_at = self.send_at = None
-            self.state = self.MONITORING
-            if self.cfg["keep_awake"]:
-                keep_awake(False)
-        self.emit("state", self._state_info())
+            for thread in {foreground, target} - {0, current}:
+                if user32.AttachThreadInput(current, thread, True):
+                    attached.append(thread)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+        finally:
+            for thread in attached:
+                user32.AttachThreadInput(current, thread, False)
+        time.sleep(0.25)
 
     def _state_info(self):
         return {
@@ -1037,8 +862,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("Claude Auto-Resume")
-        self.geometry("680x780")
-        self.minsize(620, 660)
+        self.geometry("860x960")
+        self.minsize(800, 660)
         self.configure(bg=THEME["bg"])
 
         self.cfg = load_config()
@@ -1046,6 +871,8 @@ class App(tk.Tk):
         self.out_queue = queue.Queue()
         self.worker = MonitorWorker(self.out_queue, self.cfg)
         self.windows = []            # [(hwnd, title)]
+        self.chat_rows = []
+        self.checked_chats = set(self.cfg.get("selected_chats", []))
         self.state_info = {"state": "IDLE", "reset_at": None, "send_at": None}
         self.usage = {}              # used / plan / reset / session
         self.armed_since = None
@@ -1106,6 +933,14 @@ class App(tk.Tk):
         style.configure("TSpinbox", fieldbackground=t["panel_hi"],
                         background=t["panel_hi"], foreground=t["text"],
                         arrowcolor=t["text"], insertcolor=t["text"])
+        style.configure("Treeview", background=t["log_bg"], fieldbackground=t["log_bg"],
+                        foreground=t["text"], rowheight=28, borderwidth=0)
+        style.map("Treeview", background=[("selected", t["panel_hi"])],
+                  foreground=[("selected", t["text"])])
+        style.configure("Treeview.Heading", background=t["panel_hi"], foreground=t["text"], padding=6)
+        style.configure("TNotebook", background=t["panel"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=t["panel_hi"], foreground=t["text"], padding=(14, 8))
+        style.map("TNotebook.Tab", background=[("selected", t["panel"])], foreground=[("selected", t["amber"])])
         style.configure("Vertical.TScrollbar", background=t["panel_hi"],
                         troughcolor=t["log_bg"], arrowcolor=t["muted"],
                         bordercolor=t["border"], lightcolor=t["panel_hi"],
@@ -1121,8 +956,17 @@ class App(tk.Tk):
     # ------------------------------------------------------------------ layout
     def _build_ui(self):
         t = THEME
-        root = ttk.Frame(self, padding=12)
-        root.pack(fill="both", expand=True)
+        outer = ttk.Frame(self)
+        outer.pack(fill="both", expand=True)
+        self.page_canvas = tk.Canvas(outer, bg=t["bg"], highlightthickness=0)
+        page_scroll = ttk.Scrollbar(outer, orient="vertical", command=self.page_canvas.yview)
+        page_scroll.pack(side="right", fill="y")
+        self.page_canvas.pack(side="left", fill="both", expand=True)
+        self.page_canvas.configure(yscrollcommand=page_scroll.set)
+        root = ttk.Frame(self.page_canvas, padding=12)
+        page_id = self.page_canvas.create_window(0, 0, anchor="nw", window=root)
+        root.bind("<Configure>", lambda _e: self.page_canvas.configure(scrollregion=self.page_canvas.bbox("all")))
+        self.page_canvas.bind("<Configure>", lambda e: self.page_canvas.itemconfigure(page_id, width=e.width))
 
         # --- top bar: wordmark + EN/PL toggle ---
         top = tk.Frame(root, bg=t["bg"])
@@ -1208,7 +1052,7 @@ class App(tk.Tk):
                                    font=(self.font_ui, 10))
         self.lbl_window.pack(side="left")
         self.cmb_windows = ttk.Combobox(row_win, state="readonly", width=40)
-        self.cmb_windows.pack(side="left", padx=8)
+        self.cmb_windows.pack(side="left", padx=8, fill="x", expand=True)
         self.cmb_windows.bind("<<ComboboxSelected>>", self._on_window_selected)
         self.btn_refresh = ttk.Button(
             row_win, text="", command=lambda: self.worker.command("refresh_windows"))
@@ -1224,6 +1068,48 @@ class App(tk.Tk):
         self.btn_stop.pack(side="left", padx=8)
         self.btn_send_now = ttk.Button(row_btn, text="", command=self._on_send_now)
         self.btn_send_now.pack(side="right")
+
+        self.notebook = ttk.Notebook(panel_in)
+        self.notebook.pack(fill="both", expand=True)
+        self.chats_tab = tk.Frame(self.notebook, bg=t["panel"], padx=2, pady=10)
+        self.settings_tab = tk.Frame(self.notebook, bg=t["panel"], padx=2, pady=10)
+        self.notebook.add(self.chats_tab, text="Conversations")
+        self.notebook.add(self.settings_tab, text="Settings")
+        scope_row = tk.Frame(self.chats_tab, bg=t["panel"])
+        scope_row.pack(fill="x", pady=(0, 8))
+        self.cmb_scope = ttk.Combobox(scope_row, state="readonly", width=40)
+        self.cmb_scope.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        self.cmb_scope.bind("<<ComboboxSelected>>", lambda _e: self._push_config())
+        self.btn_chats_refresh = ttk.Button(scope_row, command=lambda: self.worker.command("refresh_chats"))
+        self.btn_chats_refresh.pack(side="right")
+        tree_wrap = tk.Frame(self.chats_tab, bg=t["panel"])
+        tree_wrap.pack(fill="x")
+        self.tree_chats = ttk.Treeview(tree_wrap, columns=("watch", "chat", "source", "status"),
+                                       show="headings", height=5, selectmode="browse")
+        for column, width in (("watch", 55), ("chat", 330), ("source", 110), ("status", 210)):
+            self.tree_chats.column(column, width=width, minwidth=45, stretch=column in ("chat", "status"))
+        self.tree_chats.pack(side="left", fill="both", expand=True)
+        scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree_chats.yview)
+        scroll.pack(side="right", fill="y")
+        self.tree_chats.configure(yscrollcommand=scroll.set)
+        self.tree_chats.bind("<ButtonRelease-1>", self._toggle_chat)
+        self.tree_chats.bind("<space>", self._toggle_chat)
+        self.tree_chats.bind("<Return>", self._toggle_chat)
+        self.lbl_chats_hint = tk.Label(self.chats_tab, anchor="w", justify="left", wraplength=745,
+                                        bg=t["panel"], fg=t["muted"], font=(self.font_ui, 9))
+        self.lbl_chats_hint.pack(fill="x", pady=(6, 10))
+        self.feature_vars = {}
+        self.feature_checks = {}
+        for key in ("prefer_try_again", "retry_api_errors", "auto_approach"):
+            var = tk.BooleanVar(value=self.cfg.get(key, False))
+            check = ttk.Checkbutton(self.chats_tab, variable=var, style="Panel.TCheckbutton", command=self._push_config)
+            check.pack(anchor="w", pady=2)
+            self.feature_vars[key], self.feature_checks[key] = var, check
+        self.lbl_approach_hint = tk.Label(self.chats_tab, anchor="w", justify="left", wraplength=745,
+                                          bg=t["panel"], fg=t["muted"], font=(self.font_ui, 9))
+        self.lbl_approach_hint.pack(fill="x", padx=(20, 0), pady=(2, 0))
+
+        panel_in = self.settings_tab
 
         row_opt = tk.Frame(panel_in, bg=t["panel"])
         row_opt.pack(fill="x", pady=(0, 8))
@@ -1358,12 +1244,64 @@ class App(tk.Tk):
         self.lbl_know_reset.config(text=self._T("lbl_know_reset"))
         self.btn_arm.config(text=self._T("btn_arm"))
         self.lbl_arm_hint.config(text=self._T("lbl_arm_hint"))
+        self.notebook.tab(self.chats_tab, text="Rozmowy" if self.lang == "pl" else "Conversations")
+        self.notebook.tab(self.settings_tab, text="Ustawienia" if self.lang == "pl" else "Settings")
+        self.cmb_scope["values"] = [self._T("scope_open"), self._T("scope_selected")]
+        self.cmb_scope.current(1 if self.cfg.get("watch_scope") == "selected" else 0)
+        self.btn_chats_refresh.config(text=self._T("chats_refresh"))
+        for key, check in self.feature_checks.items():
+            check.config(text=self._T(key))
+        self.lbl_approach_hint.config(text=self._T("approach_hint"))
+        for col in ("watch", "chat", "source", "status"):
+            self.tree_chats.heading(col, text=self._T("col_" + col))
+        self._render_chats()
         self._rebuild_window_combo()
         self._render_state()
         self._render_usage()
         self._update_caption()
 
     # ----------------------------------------------------------------- events
+    def _toggle_chat(self, event):
+        if event.keysym in ("space", "Return"):
+            row = self.tree_chats.focus()
+        else:
+            row = self.tree_chats.identify_row(event.y)
+        if not row:
+            return
+        key = self.chat_rows[int(row)]["key"]
+        if key in self.checked_chats:
+            self.checked_chats.remove(key)
+        else:
+            self.checked_chats.add(key)
+        self.cmb_scope.current(1)
+        self._push_config()
+        self._render_chats()
+        return "break"
+
+    def _render_chats(self):
+        selected = self.tree_chats.focus()
+        scroll = self.tree_chats.yview()
+        self.tree_chats.delete(*self.tree_chats.get_children())
+        for i, row in enumerate(self.chat_rows):
+            status = self._T(row.get("phase", "watching"))
+            if row.get("notice") == "unavailable":
+                status = self._T("unavailable")
+            elif not row.get("available", True):
+                status = self._T("not_visible")
+            if row.get("due") and row.get("phase") in ("waiting", "verifying"):
+                status += f" · {row['due']:%H:%M:%S}"
+            checked = (row["key"] in self.checked_chats if self.cmb_scope.current() == 1 else
+                       row.get("source") == "open" and row.get("available", False))
+            self.tree_chats.insert("", "end", iid=str(i), values=(
+                ("Tak" if checked else "Nie") if self.lang == "pl" else ("Yes" if checked else "No"),
+                row["title"], self._T(row.get("source", "sidebar")), status))
+        if selected and self.tree_chats.exists(selected):
+            self.tree_chats.focus(selected)
+            self.tree_chats.selection_set(selected)
+        if scroll:
+            self.tree_chats.yview_moveto(scroll[0])
+        self.lbl_chats_hint.config(text=self._T("chats_hint" if self.chat_rows else "chats_empty"))
+
     def _on_window_selected(self, _event):
         idx = self.cmb_windows.current()
         if 0 <= idx < len(self.windows):
@@ -1377,6 +1315,7 @@ class App(tk.Tk):
         self.worker.command("stop")
 
     def _on_send_now(self):
+        self._push_config()
         if messagebox.askyesno(self._T("dlg_send_title"), self._T("dlg_send_body")):
             self.worker.command("send_now")
 
@@ -1459,10 +1398,14 @@ class App(tk.Tk):
             "auto_send": bool(self.var_autosend.get()),
             "keep_awake": bool(self.var_awake.get()),
             "message": message,
+            "watch_scope": "selected" if self.cmb_scope.current() == 1 else "open",
+            "selected_chats": sorted(self.checked_chats),
+            **{key: bool(var.get()) for key, var in self.feature_vars.items()},
         }
         self.cfg.update(payload)
         save_config(self.cfg)
         self.worker.command("config", payload)
+        self._render_chats()
 
     # ------------------------------------------------------------- worker queue
     def _poll_queue(self):
@@ -1475,7 +1418,10 @@ class App(tk.Tk):
         self.after(200, self._poll_queue)
 
     def _handle_event(self, kind, data):
-        if kind == "log":
+        if kind == "chats":
+            self.chat_rows = data
+            self._render_chats()
+        elif kind == "log":
             line, level = data
             tag = (level,) if level in ("warn", "good", "bad") else ()
             self.txt_log.configure(state="normal")
@@ -1485,9 +1431,9 @@ class App(tk.Tk):
         elif kind == "windows":
             self.windows = data
             self._rebuild_window_combo()
-            if data and self.cmb_windows.current() < 0:
-                self.cmb_windows.current(0)
-                self.worker.command("select_window", data[0][0])
+            if data:
+                index = next((i for i, (hwnd, _) in enumerate(data) if hwnd == self.worker.hwnd), 0)
+                self.cmb_windows.current(index)
             if not data:
                 self.last_status = "no_window"
                 self._update_caption()

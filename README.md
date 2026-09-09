@@ -1,201 +1,192 @@
-# Claude Desktop App Auto-Resume for Windows 11
+# Claude Desktop Auto-Resume for Windows
 
-**Don't let the 5-hour limit stop Claude in the middle of an overnight run.**
+Resume interrupted Claude Desktop conversations after a usage reset or a server
+error. Works locally through Windows UI Automation, with an English / Polish UI.
 
-When your session limit runs out in the **Claude Desktop** app (Windows), work
-just stops until you manually type "continue". This tool watches the Claude
-window for you: it detects when the limit is hit, remembers the reset time, and
-**one minute after the reset it types "continue" and presses Enter by itself**.
-You come back to finished work.
+## What it can watch
 
-It's the Windows-desktop counterpart to the popular Linux `claude-auto-retry`
-(which only works in the terminal on Linux). This one drives the **Claude
-desktop app on Windows 10/11**.
+- **All open conversation panes** in the selected Claude window, including Code
+  split views. Browser and terminal tiles are excluded.
+- **Only checked conversations**: read the loaded sidebar, check the conversations
+  you want, and let the tool visit them in turn. You can collect chats from both
+  Code and Chat and Cowork by switching modes in Claude and clicking **Read chats**.
+- Each conversation has its own reset time, retry count and status. One waiting
+  conversation does not block the others.
 
-The interface is bilingual — **English / Polish**, switchable with the EN/PL
-toggle in the top-right corner (English by default).
+## Install and run
 
-![Screenshot of the app](docs/screenshot.png)
-
----
-
-## How it works — in short
-
-1. **Watches the Claude window** every ~20 seconds (it reads the interface the
-   same way a screen reader does — no screenshots, no OCR).
-2. **Looks for the "Usage limit reached" notice first.** That red strip next to
-   the chat box is Claude's own "session blocked" signal, so it's the primary
-   trigger — the usage meter can lag or stick below 100% while the session is
-   already blocked. The reset time is read straight from the notice
-   (e.g. *"Resets at 2:40 PM"*).
-3. **Falls back to the 5-hour limit meter.** When no notice is visible but the
-   usage meter maxes out, it briefly opens Claude's usage panel (the circular
-   meter in the bottom bar) and reads the **5-hour limit** row — ignoring the
-   weekly and per-model limits, so a maxed-out weekly (e.g. Fable) limit never
-   triggers a false alarm. The reset time comes from the same panel
-   (e.g. *"Resets in 45 min"*).
-4. **One minute after the reset** it brings the Claude window to the front,
-   clicks the chat box, types `continue` and sends. Then it re-checks the 5-hour
-   limit — if it's still maxed, it retries; if it cleared, it's done.
-
-While it waits for the reset, it also **keeps the PC from going to sleep**, so
-the overnight send actually happens.
-
----
-
-## Installation
-
-### What you need
-
-- **Windows 10 or 11**
-- **Python 3.10+** — check in a terminal: `py --version`.
-  (U can get it from [python.org](https://www.python.org/downloads/) and
-  tick *"Add Python to PATH"* during install.)
-- The **Claude Desktop** app, installed and signed in.
-
-### Get it and run
+Requires Windows 10/11, Python 3.10+, and the signed-in Claude Desktop app.
 
 ```powershell
 git clone https://github.com/MichalCholajczyk/claude-desktop-auto-resume.git
 cd claude-desktop-auto-resume
 ```
 
-Then just double-click **`run.bat`** — it installs the one dependency it needs
-and starts the app.
-
-Prefer to do it by hand?
+Double-click **run.bat**. It installs `uiautomation` if needed and opens the tool.
+Or run it manually:
 
 ```powershell
-py -m pip install --user uiautomation
+py -m pip install -r requirements.txt
 py claude_auto_continue.py
 ```
 
----
+## Set up an unattended run
 
-## First run
+1. Open the conversations you need in Claude Desktop.
+2. Select the **Claude window** in Auto-Resume. Both **Refresh** and **Read chats**
+   reload the conversation list, including conversations created since the last scan.
+3. Choose **All open conversation panes**, or click the conversation rows to
+   check them. Checking a row switches to **Only checked conversations**.
+   Space and Enter also toggle the focused row.
+4. Choose the optional behaviors below. Set your continuation text on the
+   **Settings** tab; blank text falls back to `continue`.
+5. Click **Start watching**. The list shows individual states and next attempt
+   times. The clock shows the nearest scheduled attempt.
 
-1. Open **Claude Desktop** and go to the conversation you want to continue.
-2. Start this tool (`run.bat`). You'll see a dark panel with a big clock.
-3. At the top, the **"Claude window"** field usually already shows the right
-   window. If not, click **"Refresh"**.
-4. **Before leaving it overnight, test the send once**: click
-   **"Send «continue» now"**. If "continue" appears and sends in the Claude
-   window — you're good.
-5. Click **"Start watching"** and leave it running in the background.
+**Resume now…** applies to the chosen scope and asks for confirmation. It uses
+Try again when preferred and available, otherwise sends the configured message.
+It skips busy sessions, unanswered questions and existing composer drafts.
 
-A green lamp means "watching". When the tool detects the limit, the clock turns
-into a **countdown to the send**, the lamp blinks amber, and the bar underneath
-shows how much waiting is left.
+### After a usage limit
 
-> **Couldn't read the reset time?** Type it into the **"Know the reset time?"**
-> field (format `HH:MM`) and click **"Arm"** — the tool will send "continue" one
-> minute after that time.
+The tool recognizes Claude's usage-limit notice and reads its reset time. If
+necessary, it opens the usage meter for that specific pane and reads the
+**5-hour limit** row. A maxed weekly or context meter alone does not arm a send.
 
-### Custom message
+One minute after reset, the interrupted conversation receives the configured
+message. Enable **Prefer “Try again” after a limit reset** to click that button
+when available, with the configured message as fallback. A cleared banner at
+send time does not cancel a previously armed continuation.
 
-By default the tool sends **`continue`**, but you can send anything you like.
-Type your own text into the **"Message to send"** box — that exact text is
-what gets sent when the limit resets (and by the "Send now" button too). Leave
-it blank to fall back to `continue`.
+If the reset cannot be read, retry spacing defaults to ten minutes. You can also
+enter `HH:MM` in **Know the reset time?** and arm all conversations in the chosen
+scope. Manually armed timers and retry state are held in memory; after restarting
+the tool, start watching again to detect current interruptions.
 
-The box takes long prompts: it wraps and scrolls, and you can drag the handle
-underneath it to make it taller (the height is remembered between runs). What
-you type is sent as **one message**, so line breaks are collapsed into spaces —
-Enter submits in Claude's composer, so a line break inside the message would
-send it half-written.
+### API and server errors
 
----
+**Retry API and server errors** recognizes current API errors and actionable
+Try again controls. It prefers the retry button; when Code exposes only an error,
+it sends the configured continuation message. Retries start after 30 seconds,
+then back off to 60, 120, 240… seconds, capped at 15 minutes.
 
-## ⚠️ Important before leaving it overnight
+The default budget is six attempts per conversation. When it is exhausted the
+conversation stays at **Needs attention** until you stop/start watching or use
+Resume now. Account, authentication and non-retryable request errors require
+manual attention. The classification follows the documented
+[Claude API error types](https://platform.claude.com/docs/en/api/errors).
 
-- **Turn off automatic screen lock.** On a locked desktop, Windows won't let the
-  tool simulate the keyboard, so the send will fail.
-  (Settings → Accounts → Sign-in options → *"If you've been away, when should
-  Windows require you to sign in again?" → Never*, and disable any
-  password-protected screensaver.)
-- **At send time the tool briefly takes over the keyboard** — it physically
-  clicks and types into the Claude window. At night that's irrelevant; during
-  the day, just don't be typing at that exact second.
-- **Leave the Claude window open and not minimized.** To read the 5-hour limit
-  the tool briefly opens Claude's usage panel by clicking the meter, then closes
-  it and puts your mouse cursor back — this needs the window visible.
-- **Leave the right conversation open** — the tool types into whatever session
-  is currently showing in the Claude window.
+### Approach questions (optional, off by default)
 
-Safety: just before sending, the tool checks that the Claude window is really in
-front. If it can't bring it forward, it **won't type blindly** (it won't paste
-"continue" into another app) — it retries in 5 minutes instead.
+Enable **Answer approach questions automatically** to handle Claude Code's live
+question form. The tool selects options whose **labels** contain Recommended,
+rekomendacja, rekomendowane, or equivalent supported Polish forms, then clicks
+Submit. It ignores a recommendation mentioned only in an option description.
 
----
+If no option is recommended, it fills the **Other** field with:
+
+> Pick your recommended option(s).
+
+It finds Other by its name, not its position. It leaves preselected answers,
+nonempty answer drafts, unrecognized dialogs, and permission prompts alone.
+The **Send automatically** setting controls both retries and approach answers.
+
+## Practical limits
+
+- Discovery reads **loaded sidebar rows**, including pinned rows that Claude
+  exposes. It does not crawl thousands of historical chats or read private
+  AppData databases. Open an older conversation or expand its sidebar section
+  in Claude, then click Read chats again.
+- Selected conversations must have unique full titles within their mode. If
+  Claude renames one, check the new entry. Missing or ambiguous targets are
+  skipped; the tool never falls back to typing at the window's center.
+- Selection is saved by mode and title. Window handles and accessibility objects
+  are not persisted. Choose the window again if Claude restarts.
+- One Auto-Resume instance controls one selected Claude window and its splits.
+  Separate top-level Claude windows need separate instances.
+- Leave Claude visible and the desktop unlocked. Navigation and fallback keyboard
+  input can briefly take focus. Do not type while an automated action is running.
+- UI Automation depends on Claude's current accessibility structure. Unsupported
+  layouts are reported in the log and skipped. A server outage cannot be forced
+  to recover; the tool can only retry.
 
 ## Settings
 
-Available in the app window; saved to `auto_continue_config.json`:
+Saved locally in `auto_continue_config.json`:
 
-| Option | Default | What it does |
+| Setting | Default | Meaning |
 |---|---|---|
-| Language (EN/PL toggle) | EN | interface language |
-| Scan every (s) | 20 | how often the tool checks the Claude window |
-| Message to send | `continue` | the text sent when the limit resets |
-| Send automatically | ✔ | turn off to only get an audible alert instead of sending |
-| Keep the PC awake | ✔ | blocks system and display sleep while watching |
+| `language` | `en` | English / Polish |
+| `watch_scope` | `open` | `open` panes or `selected` conversations |
+| `selected_chats` | `[]` | Mode and full-title identifiers |
+| `message` | `continue` | Custom continuation text; line breaks become spaces |
+| `prefer_try_again` | `false` | Prefer Try again after a usage reset |
+| `retry_api_errors` | `true` | Retry current API/server errors |
+| `auto_approach` | `false` | Answer live approach questions |
+| `auto_send` | `true` | Disable for alerts only |
+| `keep_awake` | `true` | Keep the system and display awake while watching |
+| `scan_interval_s` | `20` | Approximate cycle interval; large lists take longer |
+| `api_retry_wait_s` | `30` | Initial API retry delay |
+| `max_retries` | `6` | Maximum attempts per interruption |
+| `retry_wait_s` | `600` | Delay when a usage reset is unknown |
+| `send_delay_after_reset_s` | `60` | Delay after a known reset |
+| `verify_delay_s` | `30` | Wait before checking an action's result |
+| `panel_backoff_s` | `300` | Minimum time between usage-panel reads per chat |
 
-More advanced fields — number of retries, retry spacing, the 5-hour "hit"
-threshold (`limit_threshold_pct`, default 100), and how often the usage panel
-may be opened (`panel_backoff_s`) — can be edited directly in
-`auto_continue_config.json`.
+The main settings are in the UI; timing and retry-budget fields can also be
+edited in the config file while Auto-Resume is closed.
 
----
+## Development and verification
 
-## Troubleshooting
+```powershell
+py test_detection.py
+py test_usage_meter.py
+py -m unittest test_sessions test_send_after_reset test_app_ui -v
+py inspect_claude.py --summary
+py test_live_claude.py
+```
 
-**It can't see the Claude window.** Make sure Claude Desktop is actually running
-(not just in the tray) and click "Refresh".
+The automated suite covers independent split targets and retry budgets, reset
+sending after the banner clears, backoff, disabled options, drafts, ambiguous
+names, recommendation labels, and Other fallback. It does not send real messages.
 
-**It keeps saying "couldn't read the usage panel".** The tool needs to click
-the usage meter in Claude's bottom bar, so the Claude window must be visible
-(not minimized) and reasonably sized. Bring the window up and it will recover on
-the next scan.
+Opt-in live checks can exercise sidebar navigation (`--walk-sidebar`), recommended
+selection (`--select-and-restore`) and literal Other-field entry
+(`--type-and-restore`). They restore the changed controls without submitting an
+answer. `inspect_claude.py` without `--summary` outputs a detailed local UI tree;
+do not publish it without reviewing its titles and other visible information.
 
-**It's not reacting to a maxed weekly/Fable limit.** That's intentional — this
-tool only acts on the **5-hour limit**. A weekly or per-model limit at 100% does
-not block a normal session, so it's ignored.
+### Smoke-test results — 2026-09-09
 
-**Live view in the Log.** The "Log" panel (and the `auto_continue.log` file)
-show exactly what the tool sees and does — that's the first place to look when
-something isn't right.
+Validated on Windows with the running Claude Desktop app:
 
----
+| Check | Result |
+|---|---|
+| Limit-notice and reset-time detection | 11 checks passed |
+| Usage-meter targeting | 8 checks passed |
+| Session scheduler, refresh, reset-send regression and Tk UI | 37 tests passed |
+| English / Polish switching and saved feature selections | Passed in the Tk UI suite |
+| Python compilation | Passed |
+| Live conversation discovery | Found 1 open Code conversation and 32 loaded sidebar entries |
+| Live sidebar navigation | Opened the requested conversation and verified its own composer |
+| Restore after navigation | Original conversation panes restored; no messages sent |
 
-## Privacy & safety
+The top **Refresh** button is covered by a regression test: it reloads both
+windows and conversations, including after Claude restarts. Earlier live checks
+also exercised two simultaneous Code panes, recommended-option selection,
+Other-field text entry and composer entry, restoring the changed controls.
+API failures and usage resets were simulated in automated tests; no live outage
+or quota exhaustion was induced. These results apply to the UI structure tested
+on this date, rather than guaranteeing compatibility with future Claude releases.
 
-The tool runs entirely **locally on your machine**. It only reads the Claude
-window's interface (via the system accessibility API — the same one screen
-readers use) and types a single word: "continue". It sends nothing to any
-external service, doesn't log conversation content, and takes no screenshots.
+## Privacy
 
----
-
-## How it works under the hood (for the curious)
-
-- The window (the Claude app is Electron/Chromium) is read through **Windows UI
-  Automation** (the `uiautomation` package). Chromium builds its accessibility
-  tree only on demand, so the tool first "wakes" it by querying the documents'
-  `TextPattern`.
-- **The 5-hour limit is read from Claude's own usage panel.** The bottom-bar
-  meter only shows the *highest* of all your limits, so a maxed weekly Fable
-  limit makes it read "100%" even when the 5-hour limit is fine. To disambiguate,
-  the tool clicks the meter to open the **Usage** popover and reads the specific
-  "5-hour limit" row (percentage + reset), then closes it with Escape and
-  restores the cursor. It only opens the popover when the cheap bottom-bar meter
-  is maxed, and backs off afterwards, to avoid flashing it constantly.
-- The chat box is a control named **Prompt**; clicking it focuses the field, then
-  `SendKeys("continue{Enter}")` types the message.
-- State machine: `Watching → 5-hour limit hit (armed, reset time known) → Send →
-  Verify → Watching` (or retry, if the 5-hour limit is still maxed).
-
----
+No API key, external backend or telemetry is used. The app reads the local
+accessibility tree and interacts with Claude. Actions submitted through Claude
+are processed by Claude normally. The local log records conversation titles,
+action statuses and diagnostics, but not full transcripts or custom message text.
+Configuration contains selected conversation titles and your custom message.
 
 ## License
 
-MIT — do whatever you want with it.
+MIT.
