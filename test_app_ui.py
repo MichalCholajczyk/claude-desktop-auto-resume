@@ -47,6 +47,17 @@ class AppUITests(unittest.TestCase):
         payload = next(payload for name, payload in commands if name == "config")
         self.assertTrue(payload["auto_approach"])
 
+    def test_refresh_reorders_rows_without_moving_keyboard_focus_to_another_chat(self):
+        self.ui.tree_chats.focus("1")
+        previous = list(self.ui.chat_rows)
+        self.ui._handle_event("chats", [
+            dict(key="code:Newest", title="Newest", source="open", available=True,
+                 phase="inactive"), *previous])
+        self.assertEqual(self.ui.tree_chats.item("0", "values")[1], "Newest")
+        self.assertEqual(self.ui.tree_chats.focus(), "2")
+        self.ui._toggle_chat(types.SimpleNamespace(keysym="space"))
+        self.assertEqual(self.saved[-1]["selected_chats"], ["chat:Beta"])
+
     def test_open_scope_shows_effective_targets_and_polish_copy(self):
         self.assertEqual(self.ui.tree_chats.item("0", "values")[0], "Yes")
         self.assertEqual(self.ui.tree_chats.item("1", "values")[0], "No")

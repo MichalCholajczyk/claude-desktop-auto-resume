@@ -420,14 +420,24 @@ class SessionEngine:
 
     def refresh(self):
         panes, entries = discover(self.ui.snapshot())
-        for item in self.catalog.values():
-            item["available"] = False
+        previous = self.catalog
+        self.catalog = {}
+        # Follow Claude's current sidebar order instead of first-discovery order.
+        # A newly opened chat may not have reached the sidebar yet: put it first.
+        sidebar_keys = {entry["key"] for entry in entries}
+        for pane in panes:
+            if pane.key not in sidebar_keys:
+                self.catalog[pane.key] = dict(key=pane.key, title=pane.title, kind=pane.kind,
+                                              source="open", available=True)
         for entry in entries:
             self.catalog[entry["key"]] = {k: v for k, v in entry.items() if k != "node"}
             self.catalog[entry["key"]]["available"] = True
         for pane in panes:
             self.catalog[pane.key] = dict(key=pane.key, title=pane.title, kind=pane.kind,
                                           source="open", available=True)
+        for key, item in previous.items():
+            if key not in self.catalog:
+                self.catalog[key] = dict(item, available=False)
         for key in self.worker.cfg.get("selected_chats", []):
             if key not in self.catalog and ":" in key:
                 kind, title = key.split(":", 1)

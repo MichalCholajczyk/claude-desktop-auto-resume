@@ -77,6 +77,43 @@ class SessionTests(unittest.TestCase):
         self.worker._process_commands()
         self.worker.engine.refresh.assert_called_once_with()
 
+    def test_refresh_follows_latest_sidebar_order_and_keeps_saved_chats(self):
+        root = node()
+        bar = node("Sidebar", parent=root)
+        def add_chat(title):
+            row = node(parent=bar)
+            node(title, "ButtonControl", row)
+            node("More options for " + title, "ButtonControl", row)
+            return row
+        older = add_chat("Older")
+        oldest = add_chat("Oldest")
+        pane("Oldest", root)  # An open split must not override sidebar order.
+        self.ui.snapshot = lambda: root
+        self.worker.cfg["selected_chats"] = ["chat:Saved"]
+        self.engine.refresh()
+        newest = add_chat("Newest")
+        bar.children = [newest, older, oldest]
+        self.engine.refresh()
+        self.assertEqual(list(self.engine.catalog),
+                         ["code:Newest", "code:Older", "code:Oldest", "chat:Saved"])
+        self.assertEqual(self.engine.catalog["code:Oldest"]["source"], "open")
+        self.assertFalse(self.engine.catalog["chat:Saved"]["available"])
+        bar.children = [older, newest, oldest]
+        self.engine.refresh()
+        self.assertEqual(list(self.engine.catalog)[:3],
+                         ["code:Older", "code:Newest", "code:Oldest"])
+
+    def test_new_pane_missing_from_sidebar_appears_before_cached_chats(self):
+        root = node()
+        pane("Older", root)
+        self.ui.snapshot = lambda: root
+        self.engine.refresh()
+        root.children.clear()
+        pane("Newest", root)
+        self.engine.refresh()
+        self.assertEqual(list(self.engine.catalog), ["code:Newest", "code:Older"])
+        self.assertFalse(self.engine.catalog["code:Older"]["available"])
+
     def test_explicit_refresh_reconnects_after_claude_restarts(self):
         self.worker._enum_windows = lambda: [(202, "Claude")]
         self.worker.hwnd = 101

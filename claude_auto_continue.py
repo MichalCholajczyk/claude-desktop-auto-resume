@@ -1278,8 +1278,11 @@ class App(tk.Tk):
         self._render_chats()
         return "break"
 
-    def _render_chats(self):
+    def _render_chats(self, rows=None):
         selected = self.tree_chats.focus()
+        selected_key = self.chat_rows[int(selected)]["key"] if selected else None
+        if rows is not None:
+            self.chat_rows = rows
         scroll = self.tree_chats.yview()
         self.tree_chats.delete(*self.tree_chats.get_children())
         for i, row in enumerate(self.chat_rows):
@@ -1295,9 +1298,9 @@ class App(tk.Tk):
             self.tree_chats.insert("", "end", iid=str(i), values=(
                 ("Tak" if checked else "Nie") if self.lang == "pl" else ("Yes" if checked else "No"),
                 row["title"], self._T(row.get("source", "sidebar")), status))
-        if selected and self.tree_chats.exists(selected):
-            self.tree_chats.focus(selected)
-            self.tree_chats.selection_set(selected)
+            if row["key"] == selected_key:
+                self.tree_chats.focus(str(i))
+                self.tree_chats.selection_set(str(i))
         if scroll:
             self.tree_chats.yview_moveto(scroll[0])
         self.lbl_chats_hint.config(text=self._T("chats_hint" if self.chat_rows else "chats_empty"))
@@ -1419,8 +1422,7 @@ class App(tk.Tk):
 
     def _handle_event(self, kind, data):
         if kind == "chats":
-            self.chat_rows = data
-            self._render_chats()
+            self._render_chats(data)
         elif kind == "log":
             line, level = data
             tag = (level,) if level in ("warn", "good", "bad") else ()
