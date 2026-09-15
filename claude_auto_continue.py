@@ -15,6 +15,7 @@ import ctypes
 import ctypes.wintypes
 import datetime as dt
 import json
+import math
 import os
 import queue
 import re
@@ -52,6 +53,7 @@ DEFAULT_CONFIG = {
     "message_box_lines": 4,         # height of the message box, in text lines
     "auto_send": True,              # False = only alert, do not send
     "keep_awake": True,             # keep Windows from sleeping
+    "start_delay_s": 10,            # countdown before the app starts driving Claude
     "watch_scope": "open",          # open panes or explicitly selected chats
     "selected_chats": [],
     "prefer_try_again": False,
@@ -67,6 +69,10 @@ DEFAULT_CONFIG = {
 }
 
 
+# Which conversations to watch is decided anew on every run: never loaded, never saved.
+RUNTIME_ONLY = ("watch_scope", "selected_chats")
+
+
 def load_config():
     cfg = dict(DEFAULT_CONFIG)
     try:
@@ -76,14 +82,11 @@ def load_config():
         pass
     if cfg.get("language") not in ("en", "pl"):
         cfg["language"] = "en"
-    if cfg.get("watch_scope") not in ("open", "selected"):
-        cfg["watch_scope"] = "open"
-    selected = cfg.get("selected_chats")
-    cfg["selected_chats"] = list(dict.fromkeys(k for k in selected if isinstance(k, str) and
-        k.startswith(("code:", "chat:")))) if isinstance(selected, list) else []
+    cfg["watch_scope"], cfg["selected_chats"] = "open", []
     for field, minimum, maximum in (("scan_interval_s", 5, 300), ("api_retry_wait_s", 5, 900),
                                     ("max_retries", 1, 20), ("retry_wait_s", 30, 86400),
-                                    ("verify_delay_s", 5, 300), ("send_delay_after_reset_s", 0, 3600)):
+                                    ("verify_delay_s", 5, 300), ("send_delay_after_reset_s", 0, 3600),
+                                    ("start_delay_s", 0, 120)):
         try:
             cfg[field] = min(maximum, max(minimum, int(cfg[field])))
         except (TypeError, ValueError):
@@ -92,9 +95,10 @@ def load_config():
 
 
 def save_config(cfg):
+    data = {key: value for key, value in cfg.items() if key not in RUNTIME_ONLY}
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            json.dump(cfg, f, indent=2, ensure_ascii=False)
+            json.dump(data, f, indent=2, ensure_ascii=False)
     except OSError:
         pass
 
@@ -245,7 +249,24 @@ STRINGS["en"].update({
     "prefer_try_again": "Prefer “Try again” after a limit reset",
     "retry_api_errors": "Retry API and server errors",
     "auto_approach": "Answer approach questions automatically",
-    "approach_hint": "Selects recommended options; otherwise asks Claude to choose in Other.",
+    "prefer_try_again_help": (
+        "When the usage limit resets, the program tries to click Claude’s “Try again” button, "
+        "which repeats the request that was cut off, instead of typing your message. If it can’t "
+        "find the button, it sends your message as usual.\n\n"
+        "Off: your message is always sent after a reset."),
+    "retry_api_errors_help": (
+        "When Claude stops because of a temporary problem on its side (an overloaded server, "
+        "“API Error”, a dropped connection), the program tries again by itself: it clicks "
+        "“Try again” or sends your message.\n\n"
+        "First retry after 30 s, each next one later (at most every 15 min), up to 6 times. "
+        "Account and access errors (e.g. signed out) are not retried — they need you. "
+        "Works only with “Send automatically” on."),
+    "auto_approach_help": (
+        "Sometimes Claude pauses and asks how to continue, offering a few answers to pick from. "
+        "The program then selects the answers marked “Recommended” and submits them.\n\n"
+        "If none is recommended, it types “Pick your recommended option(s).” into “Other”, "
+        "so Claude chooses. It won’t touch a question you’ve already started answering and "
+        "never approves permission requests. Works only with “Send automatically” on."),
     "log_chat_action": "{chat}: {action}",
     "btn_send_now": "Resume now…", "dlg_send_body": "Resume all conversations in the chosen scope now? Existing drafts and busy sessions will be skipped.",
     "state_monitoring": "Watching conversations", "state_armed": "Waiting for the next attempt",
@@ -253,13 +274,21 @@ STRINGS["en"].update({
     "cap_armed_reset": "Reset {reset} — next attempt at {send}.",
     "watching": "Watching", "waiting": "Waiting", "verifying": "Checking", "exhausted": "Needs attention",
     "sidebar": "Sidebar", "open": "Open pane", "unavailable": "Unavailable — open it in Claude",
-    "waiting_limit": "Usage limit — waiting for reset", "waiting_api": "Server error — retry scheduled",
+    "waiting_limit_at": "Usage limit — resets {reset}, next attempt {send}",
+    "waiting_limit_unknown": "Usage limit — reset time unknown, waiting for it to clear (at the latest {send})",
+    "waiting_api": "Server error — retry scheduled",
     "approach_submitted": "Recommended approach submitted", "resumed": "Block cleared",
     "permanent_error": "Account / access error — manual action required", "retry_limit": "Retry limit reached — stop/start to rearm",
     "alert_only": "Alert only — automatic sending is off", "retry": "Clicked Try again", "message": "Sent configured message",
     "cleared": "Error cleared", "busy": "Claude is already working",
     "inactive": "Not watching", "not_visible": "Not currently loaded",
     "question": "Awaiting an answer",
+    "state_starting": "Autonomous control in {sec} s",
+    "cap_starting": "Then Auto-Resume starts switching conversations and typing in Claude. Click “Stop” to cancel.",
+    "log_starting": "Autonomous control starts in {sec} s — click Stop to cancel.",
+    "starting": "Starting soon",
+    "lbl_start_delay": "Countdown before taking control",
+    "btn_default_order": "Default order",
 })
 STRINGS["pl"].update({
     "scope_open": "Wszystkie otwarte panele rozmów",
@@ -271,7 +300,24 @@ STRINGS["pl"].update({
     "prefer_try_again": "Preferuj „Try again” po resecie limitu",
     "retry_api_errors": "Ponawiaj błędy API i serwera",
     "auto_approach": "Automatycznie odpowiadaj na pytania o podejście",
-    "approach_hint": "Wybiera rekomendacje, a przy ich braku prosi Claude o wybór w polu Other.",
+    "prefer_try_again_help": (
+        "Gdy limit użycia się zresetuje, program spróbuje kliknąć w Claude przycisk „Try again”, "
+        "który ponawia przerwaną prośbę, zamiast wpisywać Twoją wiadomość. Jeśli go nie znajdzie, "
+        "wyśle wiadomość jak zwykle.\n\n"
+        "Wyłączone: po resecie zawsze idzie Twoja wiadomość."),
+    "retry_api_errors_help": (
+        "Gdy Claude przerwie pracę przez chwilowy błąd po swojej stronie (np. przeciążony serwer, "
+        "„API Error”, zerwane połączenie), program sam spróbuje ponownie: kliknie „Try again” "
+        "albo wyśle Twoją wiadomość.\n\n"
+        "Pierwsza próba po 30 s, każda kolejna później (maks. co 15 min), najwyżej 6 razy. "
+        "Błędów konta i dostępu (np. wylogowanie) nie ponawia — wtedy potrzebna jest Twoja reakcja. "
+        "Działa tylko z włączonym „Wysyłaj automatycznie”."),
+    "auto_approach_help": (
+        "Czasem Claude zatrzymuje się i pyta, jak dalej działać, pokazując kilka odpowiedzi do wyboru. "
+        "Program zaznaczy wtedy odpowiedzi oznaczone jako „Recommended” (rekomendowane) i je zatwierdzi.\n\n"
+        "Jeśli żadna nie jest polecana, wpisze w polu „Other”: „Pick your recommended option(s).”, "
+        "żeby Claude sam wybrał. Nie rusza pytań z już rozpoczętą odpowiedzią i nigdy nie zatwierdza "
+        "próśb o uprawnienia. Działa tylko z włączonym „Wysyłaj automatycznie”."),
     "log_chat_action": "{chat}: {action}",
     "btn_send_now": "Wznów teraz…", "dlg_send_body": "Wznowić teraz wszystkie rozmowy z wybranego zakresu? Szkice i pracujące sesje zostaną pominięte.",
     "state_monitoring": "Czuwam nad rozmowami", "state_armed": "Czekam na następną próbę",
@@ -279,13 +325,21 @@ STRINGS["pl"].update({
     "cap_armed_reset": "Reset {reset} — następna próba o {send}.",
     "watching": "Czuwanie", "waiting": "Oczekiwanie", "verifying": "Sprawdzanie", "exhausted": "Wymaga uwagi",
     "sidebar": "Pasek boczny", "open": "Otwarty panel", "unavailable": "Niedostępna — otwórz w Claude",
-    "waiting_limit": "Limit użycia — czekam na reset", "waiting_api": "Błąd serwera — zaplanowano próbę",
+    "waiting_limit_at": "Limit użycia — reset {reset}, wysyłka o {send}",
+    "waiting_limit_unknown": "Limit użycia — nieznana godzina resetu, czekam aż zniknie (najpóźniej {send})",
+    "waiting_api": "Błąd serwera — zaplanowano próbę",
     "approach_submitted": "Wysłano rekomendowane podejście", "resumed": "Blokada ustąpiła",
     "permanent_error": "Błąd konta / dostępu — potrzebne działanie użytkownika", "retry_limit": "Wyczerpano próby — zatrzymaj i uruchom czuwanie ponownie",
     "alert_only": "Tylko alarm — automatyczna wysyłka wyłączona", "retry": "Kliknięto Try again", "message": "Wysłano ustawioną wiadomość",
     "cleared": "Błąd ustąpił", "busy": "Claude już pracuje",
     "inactive": "Czuwanie wyłączone", "not_visible": "Obecnie niewczytana",
     "question": "Czeka na odpowiedź",
+    "state_starting": "Autonomiczna kontrola za {sec} s",
+    "cap_starting": "Potem Auto-Resume zacznie przełączać rozmowy i pisać w Claude. Kliknij „Zatrzymaj”, aby anulować.",
+    "log_starting": "Autonomiczna kontrola ruszy za {sec} s — kliknij „Zatrzymaj”, aby anulować.",
+    "starting": "Za chwilę start",
+    "lbl_start_delay": "Odliczanie przed przejęciem kontroli",
+    "btn_default_order": "Domyślna kolejność",
 })
 
 
@@ -309,21 +363,35 @@ def tr(lang, key, **kw):
 # "Resets in 1 hr") can never match.
 BANNER_LIMIT_PATTERNS = [
     r"usage\s+limit\s+reached",
-    r"you'?ve\s+reached\s+your\s+usage\s+limit",
+    r"(?:session|weekly)\s+limit\s+reached",
+    r"reached\s+your\s+(?:usage|session|weekly)\s+limit",
+    r"hit\s+your\s+(?:usage|session|weekly)\s+limit",
     r"out\s+of\s+usage",
     r"osi[ąa]gni[ęe]to\s+limit",
     r"limit\s+u[żz]ycia\s+(?:zosta[łl]\s+)?osi[ąa]gni[ęe]ty",
     r"limit\s+(?:zosta[łl]\s+)?osi[ąa]gni[ęe]ty",
 ]
 
-# e.g. "Resets Mon, Jul 13, 6:00 PM" / "resets 3pm" / "resets at 6:30 PM"
+WEEKDAY_WORD = (r"(?:mon|tue|wed|thu|fri|sat|sun|pon|wt|śr|sr|czw|pi[ąa]t|pt|sob|ndz|nie)"
+                r"[a-ząćęłńóśźż]*\.?")
+MONTH_WORD = (r"(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|sty|lut|kwi|maj|cze|lip|sie|"
+              r"wrz|paź|paz|lis|gru)[a-ząćęłńóśźż]*\.?")
+CLOCK = r"(?P<hh>\d{1,2})(?::(?P<mm>\d{2}))?\s*(?P<ampm>am|pm)?"
+
+# e.g. "Resets Mon, Jul 13, 6:00 PM" / "resets 9:30am (Europe/Warsaw)" /
+# "It resets Monday at 6:00 PM" / "resets at 6:00 PM on Thursday"
 # (also matches Claude's Polish UI wording, e.g. the "resetuje ... o 15:00" form)
 RE_RESET_ABS = re.compile(
-    r"reset(?:s|uje(?:\s*si[eę])?)?\s*(?:at\s+|o\s+|:\s*)?"
-    r"(?:(?:mon|tue|wed|thu|fri|sat|sun|pon|wt|śr|czw|pt|sob|ndz?|nie)[a-ząćęłńóśźż]*\.?,?\s+)?"
-    r"(?:(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|sty|lut|kwi|maj|cze|lip|sie|wrz|paź|lis|gru)"
-    r"[a-ząćęłńóśźż]*\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+)?"
-    r"(\d{1,2})(?::(\d{2}))?\s*(am|pm)?",
+    r"reset(?:s|uje(?:\s*si[eę])?)?\s*(?:at\s+|on\s+|o\s+|:\s*)?"
+    rf"(?:(?P<wd>{WEEKDAY_WORD}),?\s+(?:at\s+|o\s+)?)?"
+    rf"(?:(?P<mon>{MONTH_WORD})\s+(?P<day>\d{{1,2}})(?:st|nd|rd|th)?,?\s+(?:at\s+)?)?"
+    + CLOCK +
+    rf"(?:\s+on\s+(?P<wd2>{WEEKDAY_WORD}))?",
+    re.IGNORECASE)
+
+# "wait until 9:30 AM when your plan usage resets" — the time comes first
+RE_RESET_UNTIL = re.compile(
+    rf"until\s+(?:(?P<wd>{WEEKDAY_WORD}),?\s+(?:at\s+)?)?" + CLOCK + r"(?=[^.]{0,80}?\breset)",
     re.IGNORECASE)
 
 # relative form, e.g. "Resets in 2 hr 15 min" (English or Claude's Polish "za ... min")
@@ -333,48 +401,103 @@ RE_RESET_REL = re.compile(
     r"(?:(\d+)\s*(?:minut\w*|min(?:ute)?s?|m)\.?)?",
     re.IGNORECASE)
 
+# short countdown, "Resets in 4:30" (minutes:seconds)
+RE_RESET_COUNTDOWN = re.compile(r"reset\w*\s+(?:in|za)\s+(\d{1,2}):(\d{2})\b", re.IGNORECASE)
+
+# Claude Code names the zone of its reset time: "resets 9:30am (Europe/Warsaw)"
+RE_TIME_ZONE = re.compile(r"\((?P<zone>(?:[A-Za-z_]+/)+[A-Za-z0-9_+\-]+|UTC|GMT)\)")
 
 MONTHS = {"jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
           "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
           "sty": 1, "lut": 2, "kwi": 4, "maj": 5, "cze": 6,
-          "lip": 7, "sie": 8, "wrz": 9, "paź": 10, "lis": 11, "gru": 12}
+          "lip": 7, "sie": 8, "wrz": 9, "paź": 10, "paz": 10, "lis": 11, "gru": 12}
 
+WEEKDAYS = {"mon": 0, "tue": 1, "wed": 2, "thu": 3, "fri": 4, "sat": 5, "sun": 6,
+            "pon": 0, "wt": 1, "śr": 2, "sr": 2, "czw": 3, "pt": 4, "pią": 4, "pia": 4,
+            "sob": 5, "ndz": 6, "nie": 6}
+
+# A clock time that already passed today is the reset of a notice left on
+# screen, unless it is so old that only tomorrow fits: a 5-hour window cannot
+# end more than ~5 h after the limit is hit, so a same-day time more than 18 h
+# in the past belongs to tomorrow ("resets 12:30 AM" read at 23:50).
+STALE_RESET = dt.timedelta(hours=18)
+
+
+def _weekday(word):
+    word = (word or "").lower().rstrip(".")
+    return WEEKDAYS.get(word[:3], WEEKDAYS.get(word[:2]))
+
+
+def _clock(match):
+    """(hour, minute) from a CLOCK match, or None for bare numbers ("resets 5")."""
+    mm, ampm = match.group("mm"), match.group("ampm")
+    h, minute = int(match.group("hh")), int(mm) if mm is not None else 0
+    if ampm:
+        if ampm.lower() == "pm" and h < 12:
+            h += 12
+        elif ampm.lower() == "am" and h == 12:
+            h = 0
+    return (h, minute) if 0 <= h <= 23 and 0 <= minute <= 59 else None
+
+
+def _on_day(now, h, minute, weekday=None):
+    t = now.replace(hour=h, minute=minute, second=0, microsecond=0)
+    if weekday is not None:
+        days = (weekday - now.weekday()) % 7
+        t += dt.timedelta(days=days)
+        if days == 0 and t <= now and now - t >= STALE_RESET:
+            t += dt.timedelta(days=7)
+    elif t <= now and now - t >= STALE_RESET:
+        t += dt.timedelta(days=1)
+    return t
+
+
+def _zone(text):
+    m = RE_TIME_ZONE.search(text)
+    if not m:
+        return None
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(m.group("zone"))
+    except Exception:  # unknown zone or no tz database: treat as local time
+        return None
 
 
 def parse_reset_time(text, now=None):
-    """Return the reset datetime extracted from text, or None."""
+    """Return the reset datetime (naive, local time) extracted from text, or None."""
     now = now or dt.datetime.now()
+    zone = _zone(text)
+    # Clock times are resolved on the named zone's calendar, then made local.
+    base = now.astimezone(zone).replace(tzinfo=None) if zone else now
+
+    def local(t):
+        return t.replace(tzinfo=zone).astimezone().replace(tzinfo=None) if zone else t
 
     m = RE_RESET_ABS.search(text)
+    # reject matches without minutes/AM-PM/date (e.g. a stray "resets 5")
+    if m and (m.group("mm") is not None or m.group("ampm") or m.group("mon")):
+        clock = _clock(m)
+        if clock and m.group("mon"):
+            try:
+                t = dt.datetime(base.year, MONTHS[m.group("mon").lower()[:3]], int(m.group("day")), *clock)
+            except (KeyError, ValueError):
+                t = None
+            if t:
+                if t < base - dt.timedelta(hours=12):
+                    t = t.replace(year=base.year + 1)
+                return local(t)
+        elif clock:
+            return local(_on_day(base, *clock, weekday=_weekday(m.group("wd") or m.group("wd2"))))
+
+    m = RE_RESET_UNTIL.search(text)
+    if m and (m.group("mm") is not None or m.group("ampm")):
+        clock = _clock(m)
+        if clock:
+            return local(_on_day(base, *clock, weekday=_weekday(m.group("wd"))))
+
+    m = RE_RESET_COUNTDOWN.search(text)
     if m:
-        mon, day, hh, mm, ampm = m.group(1), m.group(2), m.group(3), m.group(4), m.group(5)
-        # reject matches without minutes/AM-PM/date (e.g. a stray "resets 5")
-        if mm is not None or ampm or mon:
-            h = int(hh)
-            minute = int(mm) if mm is not None else 0
-            if ampm:
-                ampm = ampm.lower()
-                if ampm == "pm" and h < 12:
-                    h += 12
-                elif ampm == "am" and h == 12:
-                    h = 0
-            if 0 <= h <= 23 and 0 <= minute <= 59:
-                if mon:
-                    month = MONTHS[mon.lower()[:3]]
-                    year = now.year
-                    try:
-                        t = dt.datetime(year, month, int(day), h, minute)
-                    except ValueError:
-                        t = None
-                    if t:
-                        if t < now - dt.timedelta(hours=12):
-                            t = t.replace(year=year + 1)
-                        return t
-                else:
-                    t = now.replace(hour=h, minute=minute, second=0, microsecond=0)
-                    if t <= now:
-                        t += dt.timedelta(days=1)
-                    return t
+        return now + dt.timedelta(minutes=int(m.group(1)), seconds=int(m.group(2)))
 
     m = RE_RESET_REL.search(text)
     if m and (m.group(1) or m.group(2)):
@@ -437,7 +560,7 @@ def process_exe_name(pid):
 class MonitorWorker(threading.Thread):
     """All UI Automation calls happen in this thread (its own COM apartment)."""
 
-    IDLE, MONITORING, ARMED, VERIFY = "IDLE", "MONITORING", "ARMED", "VERIFY"
+    IDLE, STARTING, MONITORING, ARMED, VERIFY = "IDLE", "STARTING", "MONITORING", "ARMED", "VERIFY"
 
     def __init__(self, out_queue, cfg):
         super().__init__(daemon=True)
@@ -448,6 +571,9 @@ class MonitorWorker(threading.Thread):
         self.hwnd = None
         self.reset_at = None
         self.send_at = None
+        self.start_deadline = None    # monotonic end of the start countdown
+        self.start_until = None       # the same moment as a datetime, for the UI
+        self.pending_arm = None       # manual reset time applied when the countdown ends
         self._stop_event = threading.Event()
         self.engine = SessionEngine(self)
 
@@ -522,27 +648,16 @@ class MonitorWorker(threading.Thread):
                     self.hwnd = payload
                     self.engine.refresh()
             elif name == "start":
-                if not self.hwnd:
-                    wins = self._enum_windows()
-                    if wins:
-                        self.hwnd = wins[0][0]
-                        self.emit("windows", wins)
-                if not self.hwnd:
-                    self.log("log_no_window_start", "warn")
-                    continue
-                self.state = self.MONITORING
-                self.engine.reset()
-                if self.cfg["keep_awake"]:
-                    keep_awake(False)
-                self.log("log_started")
-                self.emit("state", self._state_info())
+                self._begin()
             elif name == "stop":
                 self.state = self.IDLE
+                self.start_deadline = self.start_until = self.pending_arm = None
                 self.engine.reset()
                 self.reset_at = self.send_at = None
                 allow_sleep()
                 self.log("log_stopped")
                 self.emit("state", self._state_info())
+                self.engine.publish()     # don't leave cancelled timers in the list
             elif name == "send_now":
                 self.log("log_manual_send")
                 panes = self.engine.refresh()
@@ -559,19 +674,63 @@ class MonitorWorker(threading.Thread):
                     except Exception as exc:
                         self.log("log_chat_action", "warn", chat=key.split(":", 1)[-1], action=str(exc))
             elif name == "arm_manual":
-                self.state = self.MONITORING
-                self.engine.arm(payload)
+                if self.state == self.IDLE:
+                    self._begin(arm=payload)
+                elif self.state == self.STARTING:
+                    self.pending_arm = payload
+                else:
+                    self.engine.arm(payload)
             elif name == "config":
                 self.cfg.update(payload)
                 self.engine.next_scan = 0
 
+    def _begin(self, arm=None):
+        """Start watching after a visible countdown, so the user can let go of
+        the mouse and keyboard before the app starts switching chats."""
+        if not self.hwnd:
+            wins = self._enum_windows()
+            if wins:
+                self.hwnd = wins[0][0]
+                self.emit("windows", wins)
+        if not self.hwnd:
+            self.log("log_no_window_start", "warn")
+            return
+        self.engine.reset()
+        self.pending_arm = arm
+        if self.cfg["keep_awake"]:
+            keep_awake(False)
+        delay = self.cfg.get("start_delay_s", 0)
+        if delay <= 0:
+            self._activate()
+            return
+        self.state = self.STARTING
+        self.start_deadline = time.monotonic() + delay
+        self.start_until = dt.datetime.now() + dt.timedelta(seconds=delay)
+        self.log("log_starting", "warn", sec=delay)
+        self.emit("state", self._state_info())
+        self.engine.publish()
+
+    def _activate(self):
+        self.state = self.MONITORING
+        self.start_deadline = self.start_until = None
+        self.log("log_started")
+        self.emit("state", self._state_info())
+        if self.pending_arm is not None:
+            arm, self.pending_arm = self.pending_arm, None
+            self.engine.arm(arm)
+
     def _tick(self):
-        if self.state != self.IDLE:
-            if self.cfg["keep_awake"]:
-                keep_awake(True)
-            else:
-                allow_sleep()
-            self.engine.tick()
+        if self.state == self.IDLE:
+            return
+        if self.cfg["keep_awake"]:
+            keep_awake(True)
+        else:
+            allow_sleep()
+        if self.state == self.STARTING:
+            if time.monotonic() >= self.start_deadline:
+                self._activate()
+            return        # nothing touches Claude before the countdown ends
+        self.engine.tick()
 
     # ---------------------------------------------------------------- scanning
     def _get_window(self):
@@ -809,6 +968,7 @@ class MonitorWorker(threading.Thread):
             "state": self.state,
             "reset_at": self.reset_at,
             "send_at": self.send_at,
+            "start_until": self.start_until,
         }
 
 # ------------------------------------------------------------------ UI theme
@@ -831,9 +991,9 @@ THEME = {
 }
 
 # state -> lamp color key + label string key
-STATE_COLOR = {"IDLE": "muted", "MONITORING": "green",
+STATE_COLOR = {"IDLE": "muted", "STARTING": "amber", "MONITORING": "green",
                "ARMED": "amber", "VERIFY": "blue"}
-STATE_LABEL = {"IDLE": "state_idle", "MONITORING": "state_monitoring",
+STATE_LABEL = {"IDLE": "state_idle", "STARTING": "state_starting", "MONITORING": "state_monitoring",
                "ARMED": "state_armed", "VERIFY": "state_verify"}
 
 
@@ -871,7 +1031,14 @@ class App(tk.Tk):
         self.out_queue = queue.Queue()
         self.worker = MonitorWorker(self.out_queue, self.cfg)
         self.windows = []            # [(hwnd, title)]
-        self.chat_rows = []
+        self.chat_rows = []          # worker order: Claude's newest-first sidebar order
+        self.view_rows = []          # rows as displayed (sorted); tree iids index into this
+        self.sort_column = None      # None = Claude's own order
+        self.sort_descending = False
+        self.help_tip = None         # tooltip window for the "?" next to an option
+        self.help_label = None
+        self.help_key = None
+        self._help_timer = None
         self.checked_chats = set(self.cfg.get("selected_chats", []))
         self.state_info = {"state": "IDLE", "reset_at": None, "send_at": None}
         self.usage = {}              # used / plan / reset / session
@@ -1082,12 +1249,15 @@ class App(tk.Tk):
         self.cmb_scope.bind("<<ComboboxSelected>>", lambda _e: self._push_config())
         self.btn_chats_refresh = ttk.Button(scope_row, command=lambda: self.worker.command("refresh_chats"))
         self.btn_chats_refresh.pack(side="right")
+        self.btn_default_order = ttk.Button(scope_row, command=self._default_order, state="disabled")
+        self.btn_default_order.pack(side="right", padx=(0, 8))
         tree_wrap = tk.Frame(self.chats_tab, bg=t["panel"])
         tree_wrap.pack(fill="x")
         self.tree_chats = ttk.Treeview(tree_wrap, columns=("watch", "chat", "source", "status"),
                                        show="headings", height=5, selectmode="browse")
         for column, width in (("watch", 55), ("chat", 330), ("source", 110), ("status", 210)):
             self.tree_chats.column(column, width=width, minwidth=45, stretch=column in ("chat", "status"))
+            self.tree_chats.heading(column, command=lambda c=column: self._sort_by(c))
         self.tree_chats.pack(side="left", fill="both", expand=True)
         scroll = ttk.Scrollbar(tree_wrap, orient="vertical", command=self.tree_chats.yview)
         scroll.pack(side="right", fill="y")
@@ -1100,14 +1270,16 @@ class App(tk.Tk):
         self.lbl_chats_hint.pack(fill="x", pady=(6, 10))
         self.feature_vars = {}
         self.feature_checks = {}
+        self.feature_help = {}
         for key in ("prefer_try_again", "retry_api_errors", "auto_approach"):
             var = tk.BooleanVar(value=self.cfg.get(key, False))
-            check = ttk.Checkbutton(self.chats_tab, variable=var, style="Panel.TCheckbutton", command=self._push_config)
-            check.pack(anchor="w", pady=2)
-            self.feature_vars[key], self.feature_checks[key] = var, check
-        self.lbl_approach_hint = tk.Label(self.chats_tab, anchor="w", justify="left", wraplength=745,
-                                          bg=t["panel"], fg=t["muted"], font=(self.font_ui, 9))
-        self.lbl_approach_hint.pack(fill="x", padx=(20, 0), pady=(2, 0))
+            row = tk.Frame(self.chats_tab, bg=t["panel"])
+            row.pack(anchor="w", pady=2)
+            check = ttk.Checkbutton(row, variable=var, style="Panel.TCheckbutton", command=self._push_config)
+            check.pack(side="left")
+            icon = self._help_icon(row, key)
+            icon.pack(side="left", padx=(6, 0))
+            self.feature_vars[key], self.feature_checks[key], self.feature_help[key] = var, check, icon
 
         panel_in = self.settings_tab
 
@@ -1133,6 +1305,19 @@ class App(tk.Tk):
             row_opt, text="", style="Panel.TCheckbutton",
             variable=self.var_awake, command=self._push_config)
         self.chk_awake.pack(side="left")
+
+        row_start = tk.Frame(panel_in, bg=t["panel"])
+        row_start.pack(fill="x", pady=(0, 8))
+        self.lbl_start_delay = tk.Label(row_start, text="", bg=t["panel"],
+                                        fg=t["text"], font=(self.font_ui, 10))
+        self.lbl_start_delay.pack(side="left")
+        self.var_start_delay = tk.IntVar(value=self.cfg["start_delay_s"])
+        ttk.Spinbox(row_start, from_=0, to=120, width=4,
+                    textvariable=self.var_start_delay,
+                    command=self._push_config).pack(side="left", padx=4)
+        self.lbl_start_delay_unit = tk.Label(row_start, text="", bg=t["panel"], fg=t["text"],
+                                             font=(self.font_ui, 10))
+        self.lbl_start_delay_unit.pack(side="left")
 
         row_msg = tk.Frame(panel_in, bg=t["panel"])
         row_msg.pack(fill="x", pady=(0, 8))
@@ -1237,6 +1422,8 @@ class App(tk.Tk):
         self.btn_send_now.config(text=self._T("btn_send_now"))
         self.lbl_scan_every.config(text=self._T("lbl_scan_every"))
         self.lbl_seconds.config(text=self._T("lbl_seconds"))
+        self.lbl_start_delay.config(text=self._T("lbl_start_delay"))
+        self.lbl_start_delay_unit.config(text=self._T("lbl_seconds"))
         self.chk_autosend.config(text=self._T("chk_autosend"))
         self.chk_awake.config(text=self._T("chk_awake"))
         self.lbl_message.config(text=self._T("lbl_message"))
@@ -1251,24 +1438,121 @@ class App(tk.Tk):
         self.btn_chats_refresh.config(text=self._T("chats_refresh"))
         for key, check in self.feature_checks.items():
             check.config(text=self._T(key))
-        self.lbl_approach_hint.config(text=self._T("approach_hint"))
-        for col in ("watch", "chat", "source", "status"):
-            self.tree_chats.heading(col, text=self._T("col_" + col))
+        if self.help_key:
+            self._show_help(self.help_key)
+        self.btn_default_order.config(text=self._T("btn_default_order"))
         self._render_chats()
         self._rebuild_window_combo()
         self._render_state()
         self._render_usage()
         self._update_caption()
 
+    # ------------------------------------------------------------- option help
+    HELP_DELAY_MS = 300
+
+    def _help_icon(self, parent, key):
+        """A round "?" explaining an option in plain words, on hover, click or Tab focus."""
+        import tkinter.font as tkfont
+        t = THEME
+        size = tkfont.Font(font=(self.font_ui, 10)).metrics("linespace")
+        icon = tk.Canvas(parent, width=size, height=size, bg=t["panel"], takefocus=1,
+                         highlightthickness=1, highlightbackground=t["panel"],
+                         highlightcolor=t["amber"], cursor="question_arrow")
+        ring = icon.create_oval(2, 2, size - 2, size - 2, outline=t["muted"], width=1)
+        mark = icon.create_text(size / 2, size / 2, text="?", fill=t["muted"],
+                                font=(self.font_ui, 8, "bold"))
+
+        def lit(on):
+            color = t["amber"] if on else t["muted"]
+            icon.itemconfigure(ring, outline=color)
+            icon.itemconfigure(mark, fill=color)
+
+        def enter(_event):
+            lit(True)
+            self._cancel_help_timer()
+            self._help_timer = self.after(self.HELP_DELAY_MS, lambda: self._show_help(key))
+
+        def leave(_event):
+            lit(icon.focus_get() is icon)
+            if icon.focus_get() is not icon:
+                self._hide_help()
+
+        def focus_in(_event):
+            lit(True)
+            self._show_help(key)
+
+        def focus_out(_event):
+            lit(False)
+            self._hide_help()
+
+        icon.bind("<Enter>", enter)
+        icon.bind("<Leave>", leave)
+        icon.bind("<FocusIn>", focus_in)
+        icon.bind("<FocusOut>", focus_out)
+        icon.bind("<Button-1>", lambda _e: self._show_help(key))
+        for sequence in ("<Return>", "<space>"):
+            icon.bind(sequence, lambda _e: self._toggle_help(key))
+        icon.bind("<Escape>", lambda _e: self._hide_help())
+        return icon
+
+    def _cancel_help_timer(self):
+        if self._help_timer is not None:
+            self.after_cancel(self._help_timer)
+            self._help_timer = None
+
+    def _show_help(self, key):
+        self._cancel_help_timer()
+        t = THEME
+        if self.help_tip is None:
+            self.help_tip = tk.Toplevel(self)
+            self.help_tip.withdraw()
+            self.help_tip.wm_overrideredirect(True)
+            self.help_tip.attributes("-topmost", True)
+            border = tk.Frame(self.help_tip, bg=t["border"])
+            border.pack()
+            self.help_label = tk.Label(border, justify="left", anchor="w", wraplength=380,
+                                       bg=t["panel_hi"], fg=t["text"], font=(self.font_ui, 9),
+                                       padx=12, pady=9)
+            self.help_label.pack(padx=1, pady=1)
+        self.help_label.config(text=self._T(key + "_help"))
+        self.help_key = key
+        # Beside the icon, kept inside the app window (which may be on any monitor).
+        icon = self.feature_help[key]
+        self.help_tip.update_idletasks()
+        width, height = self.help_tip.winfo_reqwidth(), self.help_tip.winfo_reqheight()
+        right = self.winfo_rootx() + self.winfo_width()
+        bottom = self.winfo_rooty() + self.winfo_height()
+        x = min(icon.winfo_rootx() + icon.winfo_width() + 8, right - width - 8)
+        y = icon.winfo_rooty() + icon.winfo_height() + 6
+        if y + height > bottom:
+            y = icon.winfo_rooty() - height - 6
+        self.help_tip.geometry(f"+{max(0, x)}+{max(0, y)}")
+        self.help_tip.deiconify()
+
+    def _hide_help(self):
+        self._cancel_help_timer()
+        self.help_key = None
+        if self.help_tip is not None:
+            self.help_tip.withdraw()
+
+    def _toggle_help(self, key):
+        if self.help_key == key:
+            self._hide_help()
+        else:
+            self._show_help(key)
+        return "break"
+
     # ----------------------------------------------------------------- events
     def _toggle_chat(self, event):
         if event.keysym in ("space", "Return"):
             row = self.tree_chats.focus()
-        else:
+        elif self.tree_chats.identify_region(event.x, event.y) in ("cell", "tree"):
             row = self.tree_chats.identify_row(event.y)
-        if not row:
+        else:
+            return          # heading (sorting), column separator or empty space
+        if not row or int(row) >= len(self.view_rows):
             return
-        key = self.chat_rows[int(row)]["key"]
+        key = self.view_rows[int(row)]["key"]
         if key in self.checked_chats:
             self.checked_chats.remove(key)
         else:
@@ -1278,31 +1562,59 @@ class App(tk.Tk):
         self._render_chats()
         return "break"
 
+    def _sort_by(self, column):
+        if self.sort_column == column:
+            self.sort_descending = not self.sort_descending
+        else:
+            self.sort_column, self.sort_descending = column, False
+        self._render_chats()
+
+    def _default_order(self):
+        """Back to Claude's own order: newest conversation first."""
+        self.sort_column, self.sort_descending = None, False
+        self._render_chats()
+
+    def _row_cells(self, row):
+        """Displayed (watch, title, source, status) plus sort keys for one row."""
+        status = self._T(row.get("phase", "watching"))
+        if row.get("notice") == "unavailable":
+            status = self._T("unavailable")
+        elif not row.get("available", True):
+            status = self._T("not_visible")
+        due = row.get("due") if row.get("phase") in ("waiting", "verifying") else None
+        checked = (row["key"] in self.checked_chats if self.cmb_scope.current() == 1 else
+                   row.get("source") == "open" and row.get("available", False))
+        cells = (("Tak" if checked else "Nie") if self.lang == "pl" else ("Yes" if checked else "No"),
+                 row["title"], self._T(row.get("source", "sidebar")),
+                 status + (f" · {due:%H:%M:%S}" if due else ""))
+        keys = dict(watch=(not checked,), chat=(row["title"].casefold(),), source=(cells[2].casefold(),),
+                    status=(status.casefold(), due or dt.datetime.max))
+        return cells, keys
+
     def _render_chats(self, rows=None):
-        selected = self.tree_chats.focus()
-        selected_key = self.chat_rows[int(selected)]["key"] if selected else None
+        focused = self.tree_chats.focus()
+        focused_key = (self.view_rows[int(focused)]["key"]
+                       if focused and int(focused) < len(self.view_rows) else None)
         if rows is not None:
             self.chat_rows = rows
+        view = [(row, *self._row_cells(row)) for row in self.chat_rows]
+        if self.sort_column:
+            # Stable sort: equal rows keep Claude's newest-first order.
+            view.sort(key=lambda item: item[2][self.sort_column], reverse=self.sort_descending)
+        self.view_rows = [row for row, _, _ in view]
         scroll = self.tree_chats.yview()
         self.tree_chats.delete(*self.tree_chats.get_children())
-        for i, row in enumerate(self.chat_rows):
-            status = self._T(row.get("phase", "watching"))
-            if row.get("notice") == "unavailable":
-                status = self._T("unavailable")
-            elif not row.get("available", True):
-                status = self._T("not_visible")
-            if row.get("due") and row.get("phase") in ("waiting", "verifying"):
-                status += f" · {row['due']:%H:%M:%S}"
-            checked = (row["key"] in self.checked_chats if self.cmb_scope.current() == 1 else
-                       row.get("source") == "open" and row.get("available", False))
-            self.tree_chats.insert("", "end", iid=str(i), values=(
-                ("Tak" if checked else "Nie") if self.lang == "pl" else ("Yes" if checked else "No"),
-                row["title"], self._T(row.get("source", "sidebar")), status))
-            if row["key"] == selected_key:
+        for i, (row, cells, _) in enumerate(view):
+            self.tree_chats.insert("", "end", iid=str(i), values=cells)
+            if row["key"] == focused_key:
                 self.tree_chats.focus(str(i))
                 self.tree_chats.selection_set(str(i))
         if scroll:
             self.tree_chats.yview_moveto(scroll[0])
+        for col in ("watch", "chat", "source", "status"):
+            arrow = (" ▼" if self.sort_descending else " ▲") if col == self.sort_column else ""
+            self.tree_chats.heading(col, text=self._T("col_" + col) + arrow)
+        self.btn_default_order.config(state="normal" if self.sort_column else "disabled")
         self.lbl_chats_hint.config(text=self._T("chats_hint" if self.chat_rows else "chats_empty"))
 
     def _on_window_selected(self, _event):
@@ -1395,9 +1707,14 @@ class App(tk.Tk):
             interval = max(5, int(self.var_interval.get()))
         except (tk.TclError, ValueError):
             interval = DEFAULT_CONFIG["scan_interval_s"]
+        try:
+            start_delay = min(120, max(0, int(self.var_start_delay.get())))
+        except (tk.TclError, ValueError):
+            start_delay = DEFAULT_CONFIG["start_delay_s"]
         message = self._message_text()
         payload = {
             "scan_interval_s": interval,
+            "start_delay_s": start_delay,
             "auto_send": bool(self.var_autosend.get()),
             "keep_awake": bool(self.var_awake.get()),
             "message": message,
@@ -1447,9 +1764,9 @@ class App(tk.Tk):
         elif kind in ("state", "countdown"):
             prev = self.state_info.get("state")
             self.state_info = data
-            if data["state"] == "ARMED" and prev != "ARMED":
+            if data["state"] in ("ARMED", "STARTING") and prev != data["state"]:
                 self.armed_since = dt.datetime.now()
-            elif data["state"] != "ARMED":
+            elif data["state"] not in ("ARMED", "STARTING"):
                 self.armed_since = None
             self._render_state()
         elif kind == "beep":
@@ -1504,12 +1821,16 @@ class App(tk.Tk):
             parts.append(self._T("usage_5h_reset", reset=f"{h5['reset']:%a %H:%M}"))
         self.lbl_reset_seen.config(text="  ·  ".join(parts))
 
+    def _start_seconds_left(self):
+        until = self.state_info.get("start_until")
+        return max(0, math.ceil((until - dt.datetime.now()).total_seconds())) if until else 0
+
     def _render_state(self):
         st = self.state_info["state"]
         running = st != "IDLE"
         self.btn_start.config(state="disabled" if running else "normal")
         self.btn_stop.config(state="normal" if running else "disabled")
-        self.lbl_state.config(text=self._T(STATE_LABEL[st]))
+        self.lbl_state.config(text=self._T(STATE_LABEL[st], sec=self._start_seconds_left()))
         self.lamp.itemconfigure(self.lamp_id, fill=THEME[STATE_COLOR[st]])
 
     def _update_caption(self):
@@ -1518,6 +1839,8 @@ class App(tk.Tk):
         now = dt.datetime.now()
         if st == "IDLE":
             self.lbl_caption.config(text=self._T("cap_click_start"))
+        elif st == "STARTING":
+            self.lbl_caption.config(text=self._T("cap_starting"))
         elif st == "MONITORING":
             if self.last_status == "no_window":
                 self.lbl_caption.config(text=self._T("cap_no_window"))
@@ -1551,6 +1874,12 @@ class App(tk.Tk):
 
         if st == "IDLE":
             self.lbl_clock.config(text=f"{now:%H:%M:%S}", fg=t["muted"])
+        elif st == "STARTING":
+            left = self._start_seconds_left()
+            self.lbl_clock.config(text=f"00:{left // 60:02d}:{left % 60:02d}", fg=t["amber"])
+            self.lbl_state.config(text=self._T("state_starting", sec=left))
+            self.lamp.itemconfigure(
+                self.lamp_id, fill=t["amber"] if int(time.time() * 2) % 2 == 0 else t["amber_dim"])
         elif st == "MONITORING":
             self.lbl_clock.config(text=f"{now:%H:%M:%S}", fg=t["text"])
         elif st == "ARMED":
@@ -1573,10 +1902,11 @@ class App(tk.Tk):
     def _draw_progress(self):
         width = self.progress.winfo_width() or 1
         frac = 0.0
-        send_at = self.state_info.get("send_at")
-        if (self.state_info["state"] == "ARMED" and send_at and self.armed_since
-                and send_at > self.armed_since):
-            total = (send_at - self.armed_since).total_seconds()
+        st = self.state_info["state"]
+        target = self.state_info.get("start_until" if st == "STARTING" else "send_at")
+        if (st in ("ARMED", "STARTING") and target and self.armed_since
+                and target > self.armed_since):
+            total = (target - self.armed_since).total_seconds()
             done = (dt.datetime.now() - self.armed_since).total_seconds()
             frac = max(0.0, min(1.0, done / total))
         self.progress.coords(self.progress_fill, 0, 0, int(width * frac), 4)

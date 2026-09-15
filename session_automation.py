@@ -9,6 +9,8 @@ import hashlib
 import re
 import time
 
+from quota_log import QuotaLog
+
 
 PROMPTS = {"prompt", "write your prompt to claude", "reply to claude", "message claude"}
 RETRY = {"try again", "retry", "spróbuj ponownie", "ponów"}
@@ -24,6 +26,13 @@ API_ERROR = re.compile(
     r"Something went wrong|An error occurred|Network error|"
     r"Connection error|Request timed out|Serwer jest przeciążony|Błąd API)", re.I)
 PERMANENT_ERROR = re.compile(r"\b(?:400|401|402|403|404|413|authentication_error|permission_error|billing_error|invalid_request_error)\b", re.I)
+# Headline of Claude Code's limit card. Spend and credit cards are excluded:
+# they do not clear on a usage reset, so resuming there cannot help.
+LIMIT_HEADLINE = re.compile(r"(?:usage|session|weekly|(?:claude\s+)?(?:opus|sonnet|haiku|fable)"
+                            r"(?:\s[\d.]+)?)\s+limit\s+reached", re.I)
+CARD_ACTIONS = {"try again", "view details", "hide details"}
+USAGE_METER = re.compile(r"usage\s*[:,]", re.I)
+METER_CONTEXT = re.compile(r"context\s*:?\s*[\d.,]+\s*[km%]?", re.I)   # context window, not a plan limit
 
 
 def key_for(kind, title):
@@ -156,7 +165,48 @@ def question_in(pane):
     return None
 
 
+def final_limit_card(pane, parse):
+    """Claude Code ends a blocked conversation with a card in the transcript:
+    "Session limit reached" / "Try again after your session limit resets." /
+    View details / Try again (older cards collapse to a "Session limit reached"
+    button). Only the last message counts; earlier cards stay after a resume.
+    Returns (found, reset_or_None)."""
+    articles = [n for n in pane.root.walk() if n.role == "article" and n.inside("chat messages")]
+    if not articles:
+        return False, None
+    nodes = list(articles[-1].walk())
+    if any(n.name.startswith("You said:") for n in nodes):
+        return False, None
+    headlines = [n for n in nodes if LIMIT_HEADLINE.fullmatch(n.name.strip())]
+    collapsed = any(n.type == "ButtonControl" for n in headlines)
+    actions = any(n.type == "ButtonControl" and n.name.strip().casefold() in CARD_ACTIONS for n in nodes)
+    if not headlines or not (collapsed or actions):
+        return False, None
+    resets = (parse(n.name) for n in nodes if n.type == "TextControl" and "reset" in n.name.casefold())
+    return True, next((r for r in resets if r), None)
+
+
+def usage_meter(pane, parse):
+    """Highest percentage and reset time from the bottom-bar meter, e.g.
+    "Usage: Context 150k, 100% of 5-hour limit, Resets at 9:30 AM" or
+    "Usage, Weekly · all models: 19%, Resets Mon 6:00 PM"."""
+    meter = next((n for n in pane.ui_nodes() if n.type == "ButtonControl" and USAGE_METER.match(n.name)), None)
+    if meter is None:
+        return dict(pct=None, reset=None)
+    percentages = [int(p) for p in re.findall(r"(\d{1,3})\s*%", METER_CONTEXT.sub("", meter.name))]
+    return dict(pct=max(percentages) if percentages else None, reset=parse(meter.name))
+
+
+def choose_reset(candidates, now):
+    """When a limit can clear: the latest future reset among the sources, else
+    the most recent past one (the limit already reset), else None."""
+    known = [c for c in candidates if c is not None]
+    future = [c for c in known if c > now]
+    return max(future) if future else max(known, default=None)
+
+
 def signals(pane, detect_banner):
+    from claude_auto_continue import parse_reset_time
     question = question_in(pane)
     question_nodes = set(question["group"].walk()) if question else set()
     ui = [n for n in pane.ui_nodes() if n not in question_nodes and not rename_title(n)
@@ -181,7 +231,8 @@ def signals(pane, detect_banner):
                 a.name.startswith(("You said:", "Message ")) for a in ancestors)):
             errors.append(last.name)
     error = errors[-1] if errors else None
-    return dict(limit=bool(banner), reset=reset, error=error,
+    card, card_reset = final_limit_card(pane, parse_reset_time)
+    return dict(limit=bool(banner) or card, reset=reset or card_reset, error=error,
                 permanent=bool(error and PERMANENT_ERROR.search(error)),
                 retry=retries[0] if len(retries) == 1 else None,
                 busy=any(n.type == "ButtonControl" and n.name.casefold() in
@@ -396,6 +447,10 @@ class ClaudeUI:
         return None
 
 
+LIMIT_WINDOW = dt.timedelta(hours=5)   # a 5-hour limit cannot outlast its window
+CLEAR_SCANS = 2                        # scans without an unknown-reset limit before it counts as gone
+
+
 @dataclass
 class SessionState:
     phase: str = "watching"
@@ -406,12 +461,17 @@ class SessionState:
     question_id: str = ""
     notice: str = ""
     next_panel: float = 0
+    notice_label: str = ""
+    since: object = None        # first sighting of a limit whose reset is unknown
+    clear_scans: int = 0        # consecutive scans without that limit
+    not_before: object = None   # earliest next attempt after a send or a failed try
 
 
 class SessionEngine:
-    def __init__(self, worker, ui=None):
+    def __init__(self, worker, ui=None, quota=None):
         self.worker = worker
         self.ui = ui or ClaudeUI(worker)
+        self.quota = quota or QuotaLog()
         self.sessions = {}
         self.catalog = {}
         self.cursor = 0
@@ -456,7 +516,8 @@ class SessionEngine:
             state = self.sessions.get(key, SessionState())
             selected = (key in self.worker.cfg.get("selected_chats", []) if self.worker.cfg.get("watch_scope") == "selected"
                         else item.get("source") == "open" and item.get("available"))
-            phase = state.phase if selected and self.worker.state != "IDLE" else "inactive"
+            phase = ("inactive" if not selected or self.worker.state == "IDLE" else
+                     "starting" if self.worker.state == "STARTING" else state.phase)
             rows.append(dict(item, phase=phase, due=state.due, attempts=state.attempts,
                              notice=state.notice))
         self.worker.emit("chats", rows)
@@ -464,17 +525,26 @@ class SessionEngine:
         nearest = min(pending, key=lambda s: s.due) if pending else None
         self.worker.reset_at = nearest.reset if nearest else None
         self.worker.send_at = nearest.due if nearest else None
-        self.worker.emit("state", dict(state="IDLE" if self.worker.state == "IDLE" else "ARMED" if nearest else "MONITORING",
-                                       reset_at=self.worker.reset_at, send_at=self.worker.send_at))
+        shown = (self.worker.state if self.worker.state in ("IDLE", "STARTING") else
+                 "ARMED" if nearest else "MONITORING")
+        self.worker.emit("state", dict(state=shown, reset_at=self.worker.reset_at, send_at=self.worker.send_at,
+                                       start_until=getattr(self.worker, "start_until", None)))
 
     def reset(self):
         self.sessions.clear()
         self.next_scan = 0
 
-    def note(self, key, state, text):
-        if state.notice != text:
-            state.notice = text
-            self.worker.log("log_chat_action", chat=key.split(":", 1)[-1], action=self.worker.t(text))
+    def note(self, key, state, text, **details):
+        label = self.worker.t(text, **details)
+        if state.notice != text or state.notice_label != label:
+            state.notice, state.notice_label = text, label
+            self.worker.log("log_chat_action", chat=key.split(":", 1)[-1], action=label)
+
+    def logged_reset(self):
+        try:
+            return self.quota.latest_reset()
+        except Exception:   # an unreadable log must never stop the watch
+            return None
 
     def arm(self, reset):
         panes = self.refresh()
@@ -484,7 +554,7 @@ class SessionEngine:
         self.publish()
 
     def tick(self, now=None):
-        from claude_auto_continue import detect_limit_banner
+        from claude_auto_continue import detect_limit_banner, parse_reset_time
         now = now or dt.datetime.now()
         if time.monotonic() < self.next_scan:
             return
@@ -514,22 +584,28 @@ class SessionEngine:
                 return
             observed = signals(pane, detect_limit_banner)
             self.worker.emit("status", "ok")
-            # Retain the original 5-hour meter fallback, scoped to this pane.
-            # Never use a weekly/context percentage as a session-limit trigger.
-            meter = next((n for n in pane.ui_nodes() if n.type == "ButtonControl" and
-                          n.name.startswith("Usage:")), None)
-            percentages = [int(p) for p in re.findall(r"(\d+)%", meter.name)] if meter else []
-            need_panel = ((observed["limit"] and not observed["reset"]) or
-                          (not observed["limit"] and percentages and max(percentages) >= 100))
-            if need_panel and time.monotonic() >= state.next_panel and state.phase == "watching":
+            threshold = self.worker.cfg.get("limit_threshold_pct", 100)
+            meter = usage_meter(pane, parse_reset_time)
+            maxed = meter["pct"] is not None and meter["pct"] >= threshold
+            logged = self.logged_reset() if observed["limit"] or maxed else None
+            if observed["limit"]:
+                # The notice often omits the time; the meter (when maxed) and
+                # Claude Code's own log of the rejection still carry it.
+                observed["reset"] = choose_reset(
+                    [observed["reset"], meter["reset"] if maxed else None, logged], now)
+            # A maxed meter alone is ambiguous (it shows the fullest plan window):
+            # only the usage panel tells the 5-hour row from a weekly one.
+            need_panel = (observed["limit"] and not observed["reset"]) or (not observed["limit"] and maxed)
+            unknown = state.phase == "waiting" and state.reason == "limit" and state.reset is None
+            if need_panel and time.monotonic() >= state.next_panel and (state.phase == "watching" or unknown):
                 state.next_panel = time.monotonic() + self.worker.cfg.get("panel_backoff_s", 300)
                 rows, ok = self.worker._read_usage_panel(self.worker._get_window(), meter_scope=pane.root.control)
                 if ok:
                     self.worker.emit("usage", {"rows": rows, "session": pane.title})
                     h5 = rows.get("5h", {})
-                    if observed["limit"] or h5.get("pct", 0) >= self.worker.cfg.get("limit_threshold_pct", 100):
+                    if observed["limit"] or h5.get("pct", 0) >= threshold:
                         observed["limit"] = True
-                        observed["reset"] = observed["reset"] or h5.get("reset")
+                        observed["reset"] = choose_reset([observed["reset"], h5.get("reset"), logged], now)
             self.step(key, state, observed, now)
         except Exception as exc:
             self.note(key, state, str(exc))
@@ -564,24 +640,27 @@ class SessionEngine:
             return
         if state.phase == "verifying":
             if not observed["limit"] and not observed["error"] and not observed["retry"]:
-                state.phase, state.reason, state.due = "watching", "", None
-                state.attempts = 0
+                state.phase, state.reason, state.due, state.reset = "watching", "", None, None
+                state.attempts, state.since, state.clear_scans, state.not_before = 0, None, 0, None
                 self.note(key, state, "resumed")
                 return
             state.phase = "watching"
         if state.phase == "watching":
             if observed["limit"]:
-                state.reason, state.reset = "limit", observed["reset"]
-                state.due = (state.reset + dt.timedelta(seconds=cfg["send_delay_after_reset_s"]) if state.reset
-                             else now + dt.timedelta(seconds=cfg["retry_wait_s"]))
+                state.reason, state.reset, state.since, state.clear_scans = "limit", None, now, 0
             elif cfg.get("retry_api_errors") and (observed["error"] or observed["retry"]):
                 state.reason = "api"
                 state.due = now + dt.timedelta(seconds=min(900, cfg.get("api_retry_wait_s", 30) * 2 ** state.attempts))
+                self.note(key, state, "waiting_api")
             else:
                 return
             state.phase = "waiting"
-            self.note(key, state, "waiting_" + state.reason)
-        if state.phase != "waiting" or now < state.due:
+        if state.phase != "waiting":
+            return
+        if state.reason == "limit":
+            if not self.limit_due(key, state, observed, now):
+                return
+        elif now < state.due:
             return
         if state.reason == "api" and not cfg.get("retry_api_errors"):
             state.phase, state.due = "watching", None
@@ -609,6 +688,34 @@ class SessionEngine:
             result = self.ui.resume(key, cfg.get("prefer_try_again", False), state.reason == "api")
         except Exception:
             state.phase = "waiting"
-            state.due = now + dt.timedelta(seconds=max(30, cfg.get("api_retry_wait_s", 30)))
+            state.due = state.not_before = now + dt.timedelta(seconds=max(30, cfg.get("api_retry_wait_s", 30)))
             raise
+        if state.reason == "limit":
+            # If the chat is still blocked afterwards, a stale reset must not
+            # trigger another message on the very next scan.
+            state.not_before = now + dt.timedelta(seconds=cfg["retry_wait_s"])
         self.note(key, state, result)
+
+    def limit_due(self, key, state, observed, now):
+        """Schedule a limit continuation and say whether it may be typed now.
+
+        Never before a known reset (+ send delay). With the reset unknown, never
+        while the limit is still on screen: only once it has been gone for
+        CLEAR_SCANS scans, or when the 5-hour window must have ended. (15.09: the
+        reset time was unknown and blind retries typed three messages into a
+        session that stayed blocked.)"""
+        cfg = self.worker.cfg
+        delay = dt.timedelta(seconds=cfg["send_delay_after_reset_s"])
+        if observed["limit"] and observed["reset"]:
+            state.reset = observed["reset"]   # newest reading wins, e.g. a moved reset
+        if state.reset:
+            state.due = max(state.reset + delay, state.not_before or state.reset + delay)
+            self.note(key, state, "waiting_limit_at", reset=f"{state.reset:%H:%M}", send=f"{state.due:%H:%M:%S}")
+            return now >= state.due
+        state.since = state.since or now
+        cap = state.since + LIMIT_WINDOW + delay
+        state.due = max(cap, state.not_before or cap)
+        self.note(key, state, "waiting_limit_unknown", send=f"{state.due:%H:%M:%S}")
+        state.clear_scans = 0 if observed["limit"] else state.clear_scans + 1
+        gone = state.clear_scans >= CLEAR_SCANS and now >= (state.not_before or now)
+        return gone or now >= state.due

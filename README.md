@@ -28,18 +28,23 @@ toggle in the top-right corner (English by default).
    open conversation panes, including split views, or visit only the chats you
    select from the sidebar. It reads the interface like a screen reader — no
    screenshots, no OCR.
-2. **Looks for the "Usage limit reached" notice first.** That red strip next to
-   the chat box is Claude's own "session blocked" signal, so it's the primary
-   trigger — the usage meter can lag or stick below 100% while the session is
-   already blocked. The reset time is read straight from the notice
-   (e.g. *"Resets at 2:40 PM"*).
-3. **Falls back to the 5-hour limit meter.** When no notice is visible but the
-   usage meter maxes out, it briefly opens Claude's usage panel (the circular
-   meter in the bottom bar) and reads the **5-hour limit** row — ignoring the
-   weekly and per-model limits, so a maxed-out weekly (e.g. Fable) limit never
-   triggers a false alarm. The reset time comes from the same panel
-   (e.g. *"Resets in 45 min"*).
-4. **One minute after the reset** it brings the interrupted conversation to the
+2. **Looks for Claude's limit notice first.** In Code sessions that is the
+   **"Session limit reached"** card at the end of the conversation; elsewhere the
+   "Usage limit reached" strip next to the chat box. That notice is Claude's own
+   "session blocked" signal, so it's the primary trigger — the usage meter can lag
+   or stick below 100% while the session is already blocked.
+3. **Finds the reset time.** Claude doesn't always print it on the notice
+   (*"Try again after your session limit resets."*), so the tool checks, in turn:
+   the notice text, the usage meter in the bottom bar
+   (*"100% of 5-hour limit, Resets at 9:30 AM"*), and the exact reset time that
+   Claude Code writes to its local log when a request is rejected. As a last
+   resort it opens Claude's usage panel and reads the **5-hour limit** row —
+   ignoring the weekly and per-model limits, so a maxed-out weekly (e.g. Fable)
+   limit never triggers a false alarm.
+4. **Never types into a blocked conversation.** If no reset time can be found,
+   it waits until the notice disappears — or at most 5 hours, the length of the
+   limit window — instead of retrying blindly.
+5. **One minute after the reset** it brings the interrupted conversation to the
    front and sends `continue` (or your custom message). You can also choose to
    use **Try again** when that button is available. Each conversation has its
    own timer, so one waiting chat does not hold up the others.
@@ -88,18 +93,26 @@ py claude_auto_continue.py
    your open chats and split views. Or click the rows you want to watch — this
    switches to **Only checked conversations**.
 5. Set your message on the **Settings** tab and choose any optional features below.
-6. Click **"Start watching"** and leave it running in the background.
+   Not sure what an option does? Hover over (or click) the **?** next to it for a
+   plain-language explanation.
+6. Click **"Start watching"**. The tool first counts down (10 seconds by default)
+   — *"Autonomous control in 10 s"* — so you can let go of the mouse and keyboard
+   before it starts switching conversations. Click **"Stop"** to cancel. Then
+   leave it running in the background.
 
 A green lamp means "watching". When a limit is detected, the clock counts down
 to the next attempt. The conversation list shows each chat's status separately.
+Click a column header to sort the list (click again to reverse it);
+**Default order** puts it back in Claude's order, newest conversation first.
 
 To resume immediately, click **"Resume now…"** and confirm. This applies to all
 conversations in your chosen scope, so check the list first.
 
 > **Couldn't read the reset time?** Type it into the **"Know the reset time?"**
 > field (format `HH:MM`) and click **"Arm"** — the tool will resume the chosen
-> conversations one minute after that time. Timers are not saved when you close
-> the tool; start watching again after restarting it.
+> conversations one minute after that time (if watching is off, the start
+> countdown runs first). Timers are not saved when you close the tool; start
+> watching again after restarting it.
 
 ### Custom message
 
@@ -121,7 +134,9 @@ Claude window, including Code split views. Browser and terminal panes are ignore
 
 For a specific list, click **Read chats**, then check the conversations you want.
 You can add chats from both **Code** and **Chat and Cowork**: switch modes in
-Claude and click **Read chats** again. Your selections are saved between runs.
+Claude and click **Read chats** again. Selections are **not** saved: every run
+starts with **All open conversation panes** and nothing checked, so an old
+choice can never send messages to a chat you forgot about.
 
 The list includes chats currently loaded in Claude's sidebar, including pinned
 chats when visible. To add an older chat, open it or expand its sidebar section,
@@ -194,7 +209,8 @@ Available in the app window; saved to `auto_continue_config.json`:
 |---|---|---|
 | Language (EN/PL toggle) | EN | interface language |
 | Scan every (s) | 20 | how often the tool checks the Claude window |
-| Conversations to watch | All open conversation panes | watch open panes or only checked chats |
+| Countdown before taking control (s) | 10 | warning time after "Start watching" before the tool starts switching chats (0 = none) |
+| Conversations to watch | All open conversation panes | watch open panes or only checked chats (not saved) |
 | Message to send | `continue` | the text sent when the limit resets |
 | Prefer “Try again” after a limit reset | Off | use the retry button when available instead of your message |
 | Retry API and server errors | On | retry interrupted chats after temporary errors |
@@ -246,8 +262,13 @@ separate online service is needed. Messages sent through Claude are processed
 by Claude as usual.
 
 It takes no screenshots and does not save full conversations. The local log
-contains chat titles and action details; the settings file stores your selected
-chat titles and custom message.
+contains chat titles and action details; the settings file stores your settings
+and custom message (not which chats you checked).
+
+To learn when a limit resets, it reads Claude Code's local session logs
+(`%USERPROFILE%\.claude\projects`, or `CLAUDE_CONFIG_DIR`) — only the end of
+recently written files, and only the reset time of rejected requests. Nothing
+from those files is copied or stored.
 
 ---
 
@@ -264,6 +285,11 @@ chat titles and custom message.
   "5-hour limit" row (percentage + reset), then closes it with Escape and
   restores the cursor. It only opens the popover when the cheap bottom-bar meter
   is maxed, and backs off afterwards, to avoid flashing it constantly.
+- **The reset time is taken from the latest source that knows it.** Claude Code
+  records every rejected request in `~/.claude/projects/<project>/<session>.jsonl`
+  with `quotaLimits.resetsAt`; limits belong to the account, so the newest
+  rejection gives the reset even when the conversation's card leaves the time
+  out. Notice text and the usage meter are used too; the latest future time wins.
 - Before acting, the tool checks the conversation and its own message box or
   retry button. It skips missing or ambiguous chats.
 - Each conversation is tracked separately: watch for an interruption, wait for

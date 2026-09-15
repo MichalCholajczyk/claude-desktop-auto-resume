@@ -20,8 +20,9 @@ class ResetSendTests(unittest.TestCase):
         ui = FixtureUI()
         engine = SessionEngine(worker, ui)
         now = dt.datetime(2026, 9, 9, 14, 0)
+        reset = now - dt.timedelta(seconds=60)
         for signal in (observed(), observed(limit=True), observed(error="API Error: 529")):
-            state = SessionState("waiting", "limit", now)
+            state = SessionState("waiting", "limit", now, reset=reset)
             engine.step("code:Original conversation", state, signal, now)
             self.assertEqual(state.phase, "verifying")
             self.assertEqual(ui.calls[-1][0], "code:Original conversation")
@@ -34,7 +35,7 @@ class ResetSendTests(unittest.TestCase):
         ui.resume = fail
         engine = SessionEngine(worker, ui)
         now = dt.datetime(2026, 9, 9, 14, 0)
-        state = SessionState("waiting", "limit", now)
+        state = SessionState("waiting", "limit", now, reset=now - dt.timedelta(seconds=60))
         with self.assertRaises(RuntimeError):
             engine.step("code:Original conversation", state, observed(), now)
         self.assertEqual(state.phase, "waiting")

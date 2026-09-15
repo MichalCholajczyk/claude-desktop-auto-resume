@@ -77,6 +77,62 @@ check("parse_reset_time('Resets at 2:40 PM')",
       == dt.datetime(2026, 7, 14, 14, 40),
       parse_reset_time("Resets at 2:40 PM", now=NOW))
 
+# --- 8. current Claude Code wording (15.09: reset 09:30 was never parsed) ------
+TUE = dt.datetime(2026, 9, 15, 8, 50)
+
+
+def local(zone, *args):
+    from zoneinfo import ZoneInfo
+    return dt.datetime(*args, tzinfo=ZoneInfo(zone)).astimezone().replace(tzinfo=None)
+
+
+for label, text, expected in (
+        ("CLI session-limit message", "You've hit your session limit · resets 9:30am (Europe/Warsaw)",
+         local("Europe/Warsaw", 2026, 9, 15, 9, 30)),
+        ("CLI message in another time zone", "You've hit your session limit · resets 9:30am (America/New_York)",
+         local("America/New_York", 2026, 9, 15, 9, 30)),
+        ("card hint with time", "Your session limit resets at 9:30 AM. Try again then.",
+         dt.datetime(2026, 9, 15, 9, 30)),
+        ("wait-until notice", "You’re out of usage credits. Buy more to keep going now, "
+         "or wait until 9:30 AM when your plan usage resets.", dt.datetime(2026, 9, 15, 9, 30)),
+        ("weekday in meter label", "Usage: Context 205.1k, Weekly · all models: 19%, Resets Mon 6:00 PM",
+         dt.datetime(2026, 9, 21, 18, 0)),
+        ("long weekday with 'at'", "You’ve reached your weekly limit. It resets Monday at 6:00 PM.",
+         dt.datetime(2026, 9, 21, 18, 0)),
+        ("time then weekday", "Or, wait until your session limit resets at 6:00 PM on Thursday to keep working.",
+         dt.datetime(2026, 9, 17, 18, 0)),
+        ("minutes:seconds countdown", "Resets in 4:30", TUE + dt.timedelta(minutes=4, seconds=30)),
+        ("hours and minutes", "Resets in 2 hr 15 min", TUE + dt.timedelta(hours=2, minutes=15))):
+    got = parse_reset_time(text, now=TUE)
+    check(f"parse: {label}", got == expected, got)
+
+# A reset that already passed today is stale, not tomorrow's (a sticky card read
+# after the reset must not push the send 24 hours out) ...
+got = parse_reset_time("Resets at 9:30 AM", now=dt.datetime(2026, 9, 15, 19, 40))
+check("past same-day reset stays today", got == dt.datetime(2026, 9, 15, 9, 30), got)
+# ... while a 5-hour window crossing midnight still resolves to tomorrow.
+got = parse_reset_time("Resets at 12:30 AM", now=dt.datetime(2026, 9, 15, 23, 50))
+check("reset after midnight is tomorrow", got == dt.datetime(2026, 9, 16, 0, 30), got)
+got = parse_reset_time("Usage: Context 12k, Weekly · all models: 19%", now=TUE)
+check("meter without reset gives None", got is None, got)
+
+for text in ("Session limit reached", "Weekly limit reached", "Reached your session limit",
+             "You’ve reached your session limit. It resets at 9:30 AM.",
+             "You've hit your session limit · resets 9:30am (Europe/Warsaw)",
+             "You hit your usage limit. Held messages will send when it resets.",
+             "You’re out of usage credits. Buy more to keep going now, or wait until 9:30 AM when your plan usage resets."):
+    phrase, _ = detect_limit_banner([text], now=TUE)
+    check(f"notice detected: {text[:40]}", phrase is not None, phrase)
+phrase, reset = detect_limit_banner(
+    ["You’re out of usage credits. Buy more to keep going now, or wait until 9:30 AM when your plan usage resets."],
+    now=TUE)
+check("wait-until notice gives its reset", reset == dt.datetime(2026, 9, 15, 9, 30), reset)
+for text in ("Approaching session limit", "You’ve used 90% of your session limit",
+             "90% of your session limit", "Usage, Weekly · all models: 19%, Resets Mon 6:00 PM",
+             "Usage-limit notices now say which limit you hit and when it resets"):
+    phrase, _ = detect_limit_banner([text], now=TUE)
+    check(f"not a notice: {text[:40]}", phrase is None, phrase)
+
 print()
 if FAILURES:
     print(f"{len(FAILURES)} test(s) FAILED")

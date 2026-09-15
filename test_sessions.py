@@ -7,9 +7,16 @@ from unittest.mock import patch, Mock
 
 import claude_auto_continue as app
 from session_automation import (Node, Pane, SessionEngine, SessionState, ClaudeUI,
-                                discover, question_in, signals)
+                                choose_reset, discover, final_limit_card, question_in,
+                                signals, usage_meter)
 
 NOW = dt.datetime(2026, 9, 9, 14, 0)
+
+# The live card Claude Code appends when a request hits the limit (captured 15.09).
+LIMIT_CARD = (("Session limit reached", "TextControl"),
+              ("Try again after your session limit resets.", "TextControl"),
+              ("View details", "ButtonControl"), ("Try again", "ButtonControl"),
+              ("Show message actions", "ButtonControl"))
 
 
 def node(name="", kind="GroupControl", parent=None):
@@ -42,6 +49,16 @@ def question(p, labels=("Fast (Recommended)", "Slow", "Other")):
     node("Skip", "ButtonControl", group)
     node("Submit", "ButtonControl", group)
     return group
+
+
+def message(p, number, *children):
+    """A transcript article ("Message N") holding (name, control type) children."""
+    feed = next(n for n in p.root.walk() if n.name == "Chat messages")
+    article = node(f"Message {number}", parent=feed)
+    article.role = "article"
+    for name, kind in children:
+        node(name, kind, article)
+    return article
 
 
 def observed(**kwargs):
@@ -216,6 +233,70 @@ class SessionTests(unittest.TestCase):
         node("API Error: 529", "TextControl", code)
         self.assertFalse(signals(p, app.detect_limit_banner)["error"])
 
+    def test_limit_card_ending_the_transcript_is_a_limit(self):
+        p = pane()
+        message(p, 1, ("You said: implement the spec", "TextControl"))
+        message(p, 2, *LIMIT_CARD)
+        state = signals(p, app.detect_limit_banner)
+        self.assertTrue(state["limit"])
+        self.assertIsNone(state["reset"])
+        self.assertFalse(state["error"])
+
+    def test_limit_card_hint_with_time_gives_the_reset(self):
+        p = pane()
+        message(p, 1, ("Session limit reached", "TextControl"),
+                ("Your session limit resets at 9:30 AM. Try again then.", "TextControl"),
+                ("View details", "ButtonControl"), ("Try again", "ButtonControl"))
+        found, reset = final_limit_card(p, app.parse_reset_time)
+        self.assertTrue(found)
+        self.assertEqual((reset.hour, reset.minute), (9, 30))
+
+    def test_collapsed_limit_card_is_a_limit(self):
+        p = pane()
+        message(p, 1, ("Session limit reached", "ButtonControl"), ("Show message actions", "ButtonControl"))
+        self.assertTrue(signals(p, app.detect_limit_banner)["limit"])
+
+    def test_limit_card_before_newer_messages_is_history(self):
+        p = pane()
+        message(p, 1, *LIMIT_CARD)
+        message(p, 2, ("You said: continue", "TextControl"))
+        self.assertFalse(signals(p, app.detect_limit_banner)["limit"])
+        message(p, 3, ("Done — the save bug is fixed.", "TextControl"))
+        self.assertFalse(signals(p, app.detect_limit_banner)["limit"])
+
+    def test_limit_wording_in_messages_is_not_a_card(self):
+        p = pane()
+        message(p, 1, ("Session limit reached", "TextControl"),
+                ("The card then says the session limit resets later.", "TextControl"))
+        self.assertFalse(signals(p, app.detect_limit_banner)["limit"])
+        q = pane()
+        message(q, 1, ("You said: Session limit reached", "TextControl"),
+                ("Session limit reached", "TextControl"), ("Try again", "ButtonControl"))
+        self.assertFalse(signals(q, app.detect_limit_banner)["limit"])
+
+    def test_usage_meter_label_forms(self):
+        p = pane()
+        node("Usage: Context 150k, 100% of 5-hour limit, Resets at 9:30 AM", "ButtonControl", p.root)
+        meter = usage_meter(p, app.parse_reset_time)
+        self.assertEqual(meter["pct"], 100)
+        self.assertEqual((meter["reset"].hour, meter["reset"].minute), (9, 30))
+        q = pane()
+        node("Usage limit reached", "ButtonControl", q.root)
+        node("Usage, Weekly · all models: 19%, Resets Mon 6:00 PM", "ButtonControl", q.root)
+        meter = usage_meter(q, app.parse_reset_time)
+        self.assertEqual(meter["pct"], 19)
+        self.assertEqual((meter["reset"].weekday(), meter["reset"].hour), (0, 18))
+        self.assertEqual(usage_meter(pane(), app.parse_reset_time), dict(pct=None, reset=None))
+        r = pane()   # a full context window is not a plan limit
+        node("Usage: context 100%, Weekly · all models: 19%", "ButtonControl", r.root)
+        self.assertEqual(usage_meter(r, app.parse_reset_time)["pct"], 19)
+
+    def test_choose_reset_prefers_the_latest_future_time(self):
+        hour = dt.timedelta(hours=1)
+        self.assertEqual(choose_reset([None, NOW + hour, NOW + 2 * hour, NOW - hour], NOW), NOW + 2 * hour)
+        self.assertEqual(choose_reset([NOW - 2 * hour, None, NOW - hour], NOW), NOW - hour)
+        self.assertIsNone(choose_reset([None, None], NOW))
+
     def test_old_api_error_in_transcript_does_not_retrigger(self):
         p = pane()
         chat = next(n for n in p.root.walk() if n.name == "Chat messages")
@@ -232,14 +313,15 @@ class SessionTests(unittest.TestCase):
         self.assertEqual([c[0] for c in self.ui.calls], ["code:Alpha", "code:Beta"])
 
     def test_clear_limit_at_send_time_still_sends(self):
-        s = SessionState("waiting", "limit", NOW)
+        s = SessionState("waiting", "limit", NOW, reset=NOW - dt.timedelta(seconds=60))
         self.engine.step("code:Alpha", s, observed(), NOW)
         self.assertEqual(len(self.ui.calls), 1)
 
     def test_busy_session_does_not_receive_continue(self):
-        s = SessionState("waiting", "limit", NOW)
+        s = SessionState("waiting", "limit", NOW, reset=NOW - dt.timedelta(seconds=60))
         self.engine.step("code:Alpha", s, observed(busy=True), NOW)
         self.assertFalse(self.ui.calls)
+        self.assertEqual(s.phase, "watching")
 
     def test_api_delay_backoff_and_cap(self):
         self.worker.cfg["max_retries"] = 2
@@ -292,7 +374,9 @@ class SessionTests(unittest.TestCase):
 
     def test_auto_send_off_blocks_resume_and_approach(self):
         self.worker.cfg.update(auto_send=False, auto_approach=True)
-        self.engine.step("code:A", SessionState("waiting", "limit", NOW), observed(), NOW)
+        armed = SessionState("waiting", "limit", NOW, reset=NOW - dt.timedelta(seconds=60))
+        self.engine.step("code:A", armed, observed(), NOW)
+        self.assertEqual(armed.phase, "exhausted")
         self.engine.step("code:A", SessionState(), observed(question={"fingerprint": "q"}), NOW)
         self.assertFalse(self.ui.calls)
 
@@ -362,6 +446,159 @@ class SessionTests(unittest.TestCase):
         ui.value = lambda n: ""
         with self.assertRaisesRegex(RuntimeError, "No recommended"):
             ui.answer(p.key, question_in(p)["fingerprint"])
+
+
+class FakeQuota:
+    def __init__(self, reset=None):
+        self.reset = reset
+
+    def latest_reset(self):
+        return self.reset
+
+
+class LimitSafetyTests(unittest.TestCase):
+    """A limit continuation must never be typed while the conversation is still blocked."""
+
+    def setUp(self):
+        self.worker = app.MonitorWorker(queue.Queue(), dict(app.DEFAULT_CONFIG))
+        self.worker.log = lambda *a, **kw: None
+        self.ui = FixtureUI()
+        self.engine = SessionEngine(self.worker, self.ui, quota=FakeQuota())
+
+    def test_unknown_reset_is_never_sent_while_the_limit_is_visible(self):
+        # 15.09: the card had no reset time; the old engine typed at 09:03, 09:14 and
+        # 09:25 into a session that stayed blocked until 09:30.
+        start, blocked, state = dt.datetime(2026, 9, 15, 8, 50), observed(limit=True), SessionState()
+        now = start
+        while now < start + dt.timedelta(hours=5, seconds=60):
+            self.engine.step("code:Podprojekt C", state, blocked, now)
+            now += dt.timedelta(minutes=1)
+        self.assertEqual(self.ui.calls, [])
+        self.assertEqual((state.phase, state.attempts), ("waiting", 0))
+        # A 5-hour limit cannot outlast its window: one attempt at the cap.
+        self.engine.step("code:Podprojekt C", state, blocked, start + dt.timedelta(hours=5, seconds=60))
+        self.assertEqual(len(self.ui.calls), 1)
+
+    def test_unknown_reset_sends_once_the_limit_is_gone_on_two_scans(self):
+        state, minute = SessionState(), dt.timedelta(minutes=1)
+        self.engine.step("code:C", state, observed(limit=True), NOW)
+        self.engine.step("code:C", state, observed(), NOW + minute)
+        self.engine.step("code:C", state, observed(limit=True), NOW + 2 * minute)
+        self.engine.step("code:C", state, observed(), NOW + 3 * minute)
+        self.assertEqual(self.ui.calls, [])
+        self.engine.step("code:C", state, observed(), NOW + 4 * minute)
+        self.assertEqual(len(self.ui.calls), 1)
+
+    def test_reset_found_while_waiting_moves_the_send(self):
+        state, reset = SessionState(), NOW + dt.timedelta(minutes=40)
+        self.engine.step("code:C", state, observed(limit=True), NOW)
+        self.engine.step("code:C", state, observed(limit=True, reset=reset), NOW + dt.timedelta(minutes=1))
+        self.assertEqual(state.due, reset + dt.timedelta(seconds=60))
+        self.engine.step("code:C", state, observed(limit=True), reset)
+        self.assertEqual(self.ui.calls, [])
+        self.engine.step("code:C", state, observed(limit=True), reset + dt.timedelta(seconds=60))
+        self.assertEqual(len(self.ui.calls), 1)
+
+    def test_known_reset_sends_even_if_the_card_is_still_shown(self):
+        state, reset = SessionState(), NOW + dt.timedelta(minutes=40)
+        self.engine.step("code:C", state, observed(limit=True, reset=reset), NOW)
+        self.engine.step("code:C", state, observed(limit=True), reset + dt.timedelta(seconds=59))
+        self.assertEqual(self.ui.calls, [])
+        self.engine.step("code:C", state, observed(limit=True), reset + dt.timedelta(seconds=60))
+        self.assertEqual(len(self.ui.calls), 1)
+
+    def test_still_blocked_after_a_past_reset_waits_before_trying_again(self):
+        reset, state = NOW - dt.timedelta(minutes=1), SessionState()
+        self.engine.step("code:C", state, observed(limit=True, reset=reset), NOW)
+        self.assertEqual(len(self.ui.calls), 1)    # the reset already passed: resume now
+        self.engine.step("code:C", state, observed(limit=True, reset=reset), NOW + dt.timedelta(seconds=61))
+        self.assertEqual(len(self.ui.calls), 1)
+        self.assertEqual(state.due, NOW + dt.timedelta(seconds=self.worker.cfg["retry_wait_s"]))
+        self.engine.step("code:C", state, observed(limit=True, reset=reset), state.due)
+        self.assertEqual(len(self.ui.calls), 2)
+
+    def test_scan_takes_the_reset_from_claude_code_logs(self):
+        p = pane("Podprojekt C")
+        message(p, 1, ("You said: continue", "TextControl"))
+        message(p, 2, *LIMIT_CARD)
+        self.ui.snapshot = lambda: p.root
+        self.ui.resolve = lambda key, navigate=True: discover(p.root)[0][0]
+        # Unit tests must never reach the real Claude window.
+        self.worker._get_window = Mock(return_value=None)
+        self.worker._read_usage_panel = Mock(side_effect=AssertionError("usage panel opened"))
+        engine = SessionEngine(self.worker, self.ui, quota=FakeQuota(dt.datetime(2026, 9, 15, 9, 30)))
+        engine.tick(now=dt.datetime(2026, 9, 15, 8, 50))
+        state = engine.sessions["code:Podprojekt C"]
+        self.assertEqual((state.phase, state.reason), ("waiting", "limit"))
+        self.assertEqual(state.due, dt.datetime(2026, 9, 15, 9, 31))
+        self.assertEqual(self.ui.calls, [])
+
+
+class WorkerStartTests(unittest.TestCase):
+    """Start watching gives a visible countdown before the app touches Claude."""
+
+    def setUp(self):
+        self.clock = [1000.0]
+        patcher = patch.object(app.time, "monotonic", lambda: self.clock[0])
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.worker = app.MonitorWorker(queue.Queue(), dict(app.DEFAULT_CONFIG, keep_awake=False))
+        self.worker.log = Mock()
+        self.worker.hwnd = 101
+        self.worker.engine = Mock()
+
+    def command(self, name, payload=None, seconds=0.0):
+        self.worker.command(name, payload)
+        self.worker._process_commands()
+        self.clock[0] += seconds
+
+    def test_start_counts_down_before_scanning(self):
+        self.command("start", seconds=9.9)
+        self.assertEqual(self.worker.state, "STARTING")
+        self.assertEqual(self.worker._state_info()["start_until"], self.worker.start_until)
+        self.worker._tick()
+        self.worker.engine.tick.assert_not_called()
+        self.clock[0] += 0.1
+        self.worker._tick()
+        self.assertEqual(self.worker.state, "MONITORING")
+        self.worker._tick()
+        self.worker.engine.tick.assert_called_once_with()
+
+    def test_stop_during_countdown_cancels_it(self):
+        self.command("start", seconds=3)
+        self.command("stop", seconds=30)
+        self.worker._tick()
+        self.assertEqual(self.worker.state, "IDLE")
+        self.worker.engine.tick.assert_not_called()
+        self.worker.engine.publish.assert_called()
+
+    def test_zero_countdown_starts_immediately(self):
+        self.worker.cfg["start_delay_s"] = 0
+        self.command("start")
+        self.assertEqual(self.worker.state, "MONITORING")
+
+    def test_manual_arm_while_idle_waits_for_the_countdown(self):
+        reset = dt.datetime(2026, 9, 15, 9, 30)
+        self.command("arm_manual", reset, seconds=5)
+        self.worker._tick()
+        self.assertEqual(self.worker.state, "STARTING")
+        self.worker.engine.arm.assert_not_called()
+        self.clock[0] += 5
+        self.worker._tick()
+        self.assertEqual(self.worker.state, "MONITORING")
+        self.worker.engine.arm.assert_called_once_with(reset)
+
+    def test_rows_and_header_show_the_countdown(self):
+        engine = SessionEngine(self.worker, FixtureUI(), quota=FakeQuota())
+        engine.catalog = {"code:A": dict(key="code:A", title="A", kind="code", source="open", available=True)}
+        self.worker.state, self.worker.start_until = "STARTING", NOW
+        engine.publish()
+        events = {}
+        while not self.worker.out.empty():
+            kind, data = self.worker.out.get_nowait()
+            events[kind] = data
+        self.assertEqual(events["chats"][0]["phase"], "starting")
+        self.assertEqual((events["state"]["state"], events["state"]["start_until"]), ("STARTING", NOW))
 
 
 if __name__ == "__main__":
