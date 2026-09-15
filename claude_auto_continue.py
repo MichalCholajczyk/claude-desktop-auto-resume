@@ -263,10 +263,13 @@ STRINGS["en"].update({
         "Works only with “Send automatically” on."),
     "auto_approach_help": (
         "Sometimes Claude pauses and asks how to continue, offering a few answers to pick from. "
-        "The program then selects the answers marked “Recommended” and submits them.\n\n"
-        "If none is recommended, it types “Pick your recommended option(s).” into “Other”, "
-        "so Claude chooses. It won’t touch a question you’ve already started answering and "
-        "never approves permission requests. Works only with “Send automatically” on."),
+        "The program picks the answer marked “Recommended”; in a multiple-choice question it "
+        "ticks every such answer and clicks “Next” or “Submit”. Follow-up questions are "
+        "handled one by one.\n\n"
+        "If nothing is recommended (or a single-choice question recommends more than one "
+        "answer), it types “Pick your recommended option(s).” into “Other”, so Claude chooses. "
+        "It won’t touch a question you’ve already started answering and never approves "
+        "permission requests. Works only with “Send automatically” on."),
     "log_chat_action": "{chat}: {action}",
     "btn_send_now": "Resume now…", "dlg_send_body": "Resume all conversations in the chosen scope now? Existing drafts and busy sessions will be skipped.",
     "state_monitoring": "Watching conversations", "state_armed": "Waiting for the next attempt",
@@ -314,10 +317,13 @@ STRINGS["pl"].update({
         "Działa tylko z włączonym „Wysyłaj automatycznie”."),
     "auto_approach_help": (
         "Czasem Claude zatrzymuje się i pyta, jak dalej działać, pokazując kilka odpowiedzi do wyboru. "
-        "Program zaznaczy wtedy odpowiedzi oznaczone jako „Recommended” (rekomendowane) i je zatwierdzi.\n\n"
-        "Jeśli żadna nie jest polecana, wpisze w polu „Other”: „Pick your recommended option(s).”, "
-        "żeby Claude sam wybrał. Nie rusza pytań z już rozpoczętą odpowiedzią i nigdy nie zatwierdza "
-        "próśb o uprawnienia. Działa tylko z włączonym „Wysyłaj automatycznie”."),
+        "Program wybiera wtedy odpowiedź oznaczoną jako „Recommended” (rekomendowana), a w pytaniu "
+        "wielokrotnego wyboru zaznacza wszystkie takie odpowiedzi i klika „Next” albo „Submit”. "
+        "Kolejne pytania obsługuje po kolei.\n\n"
+        "Jeśli nic nie jest polecane (albo pytanie jednokrotnego wyboru poleca kilka odpowiedzi), "
+        "wpisze w polu „Other”: „Pick your recommended option(s).”, żeby Claude sam wybrał. "
+        "Nie rusza pytań z już rozpoczętą odpowiedzią i nigdy nie zatwierdza próśb o uprawnienia. "
+        "Działa tylko z włączonym „Wysyłaj automatycznie”."),
     "log_chat_action": "{chat}: {action}",
     "btn_send_now": "Wznów teraz…", "dlg_send_body": "Wznowić teraz wszystkie rozmowy z wybranego zakresu? Szkice i pracujące sesje zostaną pominięte.",
     "state_monitoring": "Czuwam nad rozmowami", "state_armed": "Czekam na następną próbę",

@@ -71,10 +71,16 @@ def main():
         questions = [(p, question_in(p)) for p in panes if question_in(p)]
         assert len(questions) == 1, "Expected exactly one live question"
         p, q = questions[0]
+        print(f"Question card: {len(q['options'])} options, main button {q['submit'].name!r}")
+        if ui.selection_kind(q["options"][0]) != "toggle":
+            # On a single-choice card a click (or typing in Other) already picks an
+            # answer that cannot be undone, so the restore checks cannot run safely.
+            print("Single-choice card: select/type checks skipped; nothing was touched")
+            return
         if args.type_and_restore:
             field = q["other"]
             assert field and not ui.value(field), "Other field must be empty"
-            old_other = next(n for n in q["options"] if n.name == "Other")
+            old_other = next(o for o, label in zip(q["options"], q["labels"]) if label == "Other")
             old_selected = old_other.control.GetTogglePattern().ToggleState
             try:
                 ui.type_into(field, "Pick your recommended option(s). {test} + ąćęłńóśźż")
@@ -83,7 +89,7 @@ def main():
                 current = question_in(ui.resolve(p.key, navigate=False))
                 assert current, "Question changed during smoke test"
                 current["other"].control.GetValuePattern().SetValue("")
-                other = next(n for n in current["options"] if n.name == "Other")
+                other = next(o for o, label in zip(current["options"], current["labels"]) if label == "Other")
                 if other.control.GetTogglePattern().ToggleState != old_selected:
                     ui.click(other)
                 assert not ui.value(current["other"])

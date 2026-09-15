@@ -15,7 +15,12 @@ from quota_log import QuotaLog
 PROMPTS = {"prompt", "write your prompt to claude", "reply to claude", "message claude"}
 RETRY = {"try again", "retry", "spróbuj ponownie", "ponów"}
 SUBMIT = {"submit", "wyślij", "zatwierdź"}
+# The card's main button reads "Next" on every question but the last one.
+PRIMARY = SUBMIT | {"next", "dalej"}
+QUESTION_CONTROLS = PRIMARY | {"dismiss question", "view question options", "skip", "back",
+                               "next question", "previous question"}
 OTHER = {"other", "inne", "inna", "inny"}
+PICK_FOR_ME = "Pick your recommended option(s)."
 RECOMMENDED = re.compile(r"\b(?:recommended|rekomendowan\w*|rekomendacja|zalecan\w*|polecan\w*)\b", re.I)
 NEGATIVE = re.compile(r"\b(?:not\s+recommended|nie\s+(?:zalecan\w*|polecan\w*|rekomendowan\w*))\b", re.I)
 API_ERROR = re.compile(
@@ -140,26 +145,28 @@ def question_in(pane):
             continue
         group = marker.parent
         children = list(group.walk())
-        submit = [n for n in children if n.type == "ButtonControl" and n.name.casefold() in SUBMIT]
+        submit = [n for n in children if n.type == "ButtonControl" and n.name.casefold() in PRIMARY]
         if len(submit) != 1:
             continue
         options = [n for n in group.children if n.type in
                    ("ButtonControl", "CheckBoxControl", "RadioButtonControl") and
-                   n.name not in ("Dismiss question", "View question options", "Skip") and
-                   n.name.casefold() not in SUBMIT]
+                   n.name.casefold() not in QUESTION_CONTROLS]
         if len(options) < 2:
             continue
-        recommended = []
-        for option in options:
-            # The first text child is the label; descriptions may mention other
-            # recommendations and must not select a different option by accident.
-            label = next((n.name for n in option.walk() if n.type == "TextControl"), option.name)
-            if RECOMMENDED.search(label) and not NEGATIVE.search(label):
-                recommended.append(option)
+        # The first text child is the label; descriptions may mention other
+        # recommendations and must not select a different option by accident.
+        labels = [next((n.name for n in option.walk() if n.type == "TextControl"), option.name).strip()
+                  for option in options]
+        recommended = [option for option, label in zip(options, labels)
+                       if RECOMMENDED.search(label) and not NEGATIVE.search(label)]
         other = [n for n in children if n.type == "EditControl" and
                  n.name.casefold() in {"other option", "other", "inna odpowiedź"}]
-        identity = "\n".join(n.name for n in group.children)
-        return dict(group=group, options=options, recommended=recommended,
+        # Identity from text that does not change while options are ticked:
+        # the question (and "2/3" counter), the option labels and the main button.
+        in_options = {n for option in options for n in option.walk()}
+        texts = [n.name for n in children if n.type == "TextControl" and n not in in_options]
+        identity = "\n".join([*texts, *labels, submit[0].name])
+        return dict(group=group, options=options, labels=labels, recommended=recommended,
                     other=other[0] if len(other) == 1 else None,
                     submit=submit[0], fingerprint=hashlib.sha256(identity.encode()).hexdigest())
     return None
@@ -243,6 +250,7 @@ def signals(pane, detect_banner):
 class ClaudeUI:
     def __init__(self, worker):
         self.worker = worker
+        self.clicks = 0     # clicks attempted; tells whether a failed action had any effect
 
     def snapshot(self):
         from claude_auto_continue import auto
@@ -278,6 +286,7 @@ class ClaudeUI:
             raise RuntimeError("Claude is not foreground")
         if not node.visible or not node.control.IsEnabled or node.control.IsOffscreen:
             raise RuntimeError("Control is unavailable")
+        self.clicks += 1
         node.control.Click(simulateMove=False)
 
     def resolve(self, key, navigate=True):
@@ -385,54 +394,97 @@ class ClaudeUI:
         return "message"
 
     def answer(self, key, fingerprint):
+        """Answer the live question card with its recommended choice, or ask
+        Claude to choose via Other.
+
+        Claude has two kinds of card. Single choice: clicking an option records
+        the answer at once and moves to the next question (or submits the last
+        one), so no selection state is exposed. Multiple choice: options toggle
+        (aria-pressed) until Next / Submit. Answers already started are left alone."""
         pane = self.resolve(key)
         q = question_in(pane) if pane else None
         if not q or q["fingerprint"] != fingerprint:
             return False
-        # Respect a partially entered answer or selection made by the user.
         if q["other"] and self.value(q["other"]):
             raise RuntimeError("Question already has a draft answer")
-        for option in q["options"]:
-            selected = self.selected(option)
-            if selected is None:
-                raise RuntimeError("Cannot verify question selection state")
-            if selected:
-                raise RuntimeError("Question already has a selected answer")
-        chosen = q["recommended"]
-        if len(chosen) > 1 and any(n.type == "RadioButtonControl" for n in chosen):
-            raise RuntimeError("Multiple recommendations in a single-choice question")
+        kinds = {self.selection_kind(n) for n in q["options"]}
+        if len(kinds) != 1:
+            raise RuntimeError("Cannot verify question selection state")
+        kind = kinds.pop()   # "toggle": multiple choice; "select" or None: single choice
+        # The main button stays disabled until something is chosen.
+        if any(self.selected(n) for n in q["options"]) or self.enabled(q["submit"]):
+            raise RuntimeError("Question already has a selected answer")
+        chosen = [label for option, label in zip(q["options"], q["labels"]) if option in q["recommended"]]
+        if kind != "toggle" and len(chosen) != 1:
+            chosen = []   # a single pick: let Claude choose rather than guess between recommendations
         if not chosen:
-            if not q["other"]:
-                raise RuntimeError("No recommended option or Other field")
-            other_buttons = [n for n in q["options"] if n.name.casefold() in OTHER]
-            if len(other_buttons) == 1:
-                self.click(other_buttons[0])
-                pane = self.resolve(key, navigate=False)
-                q = question_in(pane) if pane else None
-                if not q or q["fingerprint"] != fingerprint:
-                    return False
-            self.type_into(q["other"], "Pick your recommended option(s).")
-        else:
-            # Re-resolve between every selection: no stale coordinates when the
-            # card grows, changes question, or the user rearranges a split.
-            labels = [n.name for n in chosen]
-            for label in labels:
-                pane = self.resolve(key, navigate=False)
-                current = question_in(pane) if pane else None
-                if not current or current["fingerprint"] != fingerprint:
-                    return False
-                option = next((n for n in current["recommended"] if n.name == label), None)
-                if not option:
-                    return False
-                self.click(option)
-        pane = self.resolve(key, navigate=False)
-        current = question_in(pane) if pane else None
-        if not current or current["fingerprint"] != fingerprint:
+            return self._pick_in_other(key, fingerprint, q)
+        if kind is None:
+            self.click(next(o for o, label in zip(q["options"], q["labels"]) if label == chosen[0]))
+            return self._accepted(key, fingerprint)
+        # Re-resolve between every selection: no stale coordinates when the
+        # card grows, changes question, or the user rearranges a split.
+        for label in chosen:
+            current = self._same_question(key, fingerprint)
+            option = current and next((o for o, l in zip(current["options"], current["labels"]) if l == label), None)
+            if not option:
+                return False
+            self.click(option)
+        current = self._same_question(key, fingerprint)
+        if not current:
             return False
-        if chosen and not all(self.selected(n) for n in current["recommended"]):
+        picked = [o for o, label in zip(current["options"], current["labels"]) if label in chosen]
+        if len(picked) != len(chosen) or not all(self.selected(o) for o in picked):
             raise RuntimeError("Recommended selections could not be verified")
         self.click(current["submit"])
         return True
+
+    def _pick_in_other(self, key, fingerprint, q):
+        """No single recommendation: ask Claude to choose, through the Other field."""
+        if not q["other"]:
+            raise RuntimeError("No recommended option or Other field")
+        other = [o for o, label in zip(q["options"], q["labels"]) if label.casefold() in OTHER]
+        if len(other) == 1:
+            self.click(other[0])   # selects Other; even on a single-choice card this does not answer yet
+            q = self._same_question(key, fingerprint)
+            if not q:
+                return False
+        self.type_into(q["other"], PICK_FOR_ME)
+        current = self._same_question(key, fingerprint)
+        if not current:
+            return False
+        self.click(current["submit"])
+        return True
+
+    def _same_question(self, key, fingerprint):
+        pane = self.resolve(key, navigate=False)
+        q = question_in(pane) if pane else None
+        return q if q and q["fingerprint"] == fingerprint else None
+
+    def _accepted(self, key, fingerprint):
+        """A single-choice click answers at once, so the card has to move on."""
+        for _ in range(6):
+            time.sleep(0.3)
+            if self._same_question(key, fingerprint) is None:
+                return True
+        raise RuntimeError("Answer click was not accepted")
+
+    @staticmethod
+    def selection_kind(node):
+        """"toggle" (multiple choice), "select" (native single choice) or None
+        when the option exposes no selection state (single choice card)."""
+        for getter, kind in (("GetTogglePattern", "toggle"), ("GetSelectionItemPattern", "select")):
+            method = getattr(node.control, getter, None)
+            if method and method() is not None:
+                return kind
+        return None
+
+    @staticmethod
+    def enabled(node):
+        try:
+            return bool(node.control.IsEnabled)
+        except Exception:
+            return None
 
     @staticmethod
     def selected(node):
@@ -626,7 +678,14 @@ class SessionEngine:
             if cfg.get("auto_approach") and cfg["auto_send"] and qid != state.question_id:
                 # Mark before side effects: an uncertain Submit must not be repeated.
                 state.question_id = qid
-                if self.ui.answer(key, qid):
+                clicks = getattr(self.ui, "clicks", None)
+                try:
+                    answered = self.ui.answer(key, qid)
+                except Exception:
+                    if clicks is not None and self.ui.clicks == clicks:
+                        state.question_id = ""   # nothing was clicked: the next scan may try again
+                    raise
+                if answered:
                     self.note(key, state, "approach_submitted")
             return
         if state.phase == "question":

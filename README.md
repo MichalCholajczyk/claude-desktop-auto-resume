@@ -165,10 +165,17 @@ Sign-in, access and invalid-request errors need your attention directly.
 ### Answer approach questions automatically
 
 This option is **off by default**. Turn on **Answer approach questions
-automatically** to let the tool select answers marked **Recommended** (including
-Polish labels such as **rekomendacja**) and submit them.
+automatically** to let the tool pick answers marked **Recommended** (including
+Polish labels such as **rekomendacja**). Claude asks two kinds of question, and
+cards with several questions are answered one question at a time:
 
-If no answer is marked as recommended, it enters this in **Other** and submits:
+- **Single choice** — clicking an option is the answer (Claude moves straight to
+  the next question), so the tool clicks the recommended option.
+- **Multiple choice** — the tool ticks every recommended option, then clicks
+  **Next** or **Submit**.
+
+If no answer is marked as recommended — or a single-choice question recommends
+more than one — it enters this in **Other** and submits:
 
 > Pick your recommended option(s).
 

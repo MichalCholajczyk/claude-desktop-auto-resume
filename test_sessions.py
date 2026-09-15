@@ -448,6 +448,141 @@ class SessionTests(unittest.TestCase):
             ui.answer(p.key, question_in(p)["fingerprint"])
 
 
+def claude_question(p, labels, multi=False, primary="Submit", answered=False):
+    """The question card as Claude 1.5238x exposes it (captured 15.09): option
+    buttons hold a label, a description and a digit key. Single choice exposes no
+    selection state (a click answers at once); multiple choice toggles aria-pressed."""
+    group = node(parent=p.root)
+    node("Co znaczy „ile serii z rzędu”? Silnik dziś nie liczy serii.", "TextControl", group)
+    node("View question options", "ButtonControl", group)
+    node("Dismiss question", "ButtonControl", group)
+    for number, label in enumerate([*labels, "Other"], 1):
+        button = node(f"{label} opis {number}", "ButtonControl", group)
+        node(label, "TextControl", node(parent=button))
+        if label != "Other":
+            node("opis", "TextControl", node(parent=button))
+        node(str(number), "TextControl", button)
+        state = types.SimpleNamespace(ToggleState=0)
+        button.control = types.SimpleNamespace(
+            GetTogglePattern=(lambda s=state: s) if multi else (lambda: None), IsEnabled=True)
+    node("Other option", "EditControl", group)
+    node("Skip", "ButtonControl", group)
+    submit = node(primary, "ButtonControl", group)
+    submit.control = types.SimpleNamespace(IsEnabled=answered)
+    return group
+
+
+class QuestionAnswerTests(unittest.TestCase):
+    """Auto-answering both kinds of Claude question cards."""
+
+    def setUp(self):
+        self.worker = app.MonitorWorker(queue.Queue(), dict(app.DEFAULT_CONFIG))
+        self.worker.log = lambda *a, **kw: None
+        self.pane = pane("Onboarding i wskaźniki ćwiczeń")
+        self.ui = ClaudeUI(self.worker)
+        self.ui.resolve = lambda *a, **kw: self.pane
+        self.ui.value = lambda n: ""
+        self.calls = []
+        patcher = patch("session_automation.time.sleep", lambda s: None)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def clicks_answer_at_once(self, n):
+        """Single choice: Claude records the clicked option and the card goes away."""
+        self.calls.append(n.name.split(" opis ")[0])
+        if n.type == "ButtonControl" and n.name.split(" opis ")[0] not in ("Other", "Submit", "Next"):
+            self.pane.root.children = [c for c in self.pane.root.children if not any(
+                b.name == "Dismiss question" for b in c.children)]
+
+    def toggles(self, n):
+        """Multiple choice: an option flips aria-pressed; Submit / Next only records the click."""
+        self.calls.append(n.name.split(" opis ")[0])
+        pattern = getattr(n.control, "GetTogglePattern", lambda: None)()
+        if pattern is not None:
+            pattern.ToggleState = 1 - pattern.ToggleState
+
+    def answer(self):
+        return self.ui.answer(self.pane.key, question_in(self.pane)["fingerprint"])
+
+    def test_single_choice_clicks_only_the_recommended_option(self):
+        claude_question(self.pane, ("Serie z recepty (Recommended)", "Wszystkie serie na górze", "Z notatki trenera"))
+        self.ui.click = self.clicks_answer_at_once
+        self.assertTrue(self.answer())
+        self.assertEqual(self.calls, ["Serie z recepty (Recommended)"])
+
+    def test_single_choice_click_that_did_not_register_is_reported(self):
+        claude_question(self.pane, ("Serie z recepty (Recommended)", "Wszystkie serie na górze"))
+        self.ui.click = self.calls.append          # the card stays: nothing was accepted
+        with self.assertRaisesRegex(RuntimeError, "not accepted"):
+            self.answer()
+        self.assertEqual(len(self.calls), 1)
+
+    def test_single_choice_without_one_recommendation_asks_claude_in_other(self):
+        for labels in (("Szybko", "Wolno"), ("Szybko (Recommended)", "Wolno (Recommended)")):
+            with self.subTest(labels=labels):
+                self.pane = pane("Onboarding i wskaźniki ćwiczeń")
+                claude_question(self.pane, labels)
+                self.calls.clear()
+                self.ui.click = self.clicks_answer_at_once
+                self.ui.type_into = lambda n, text: self.calls.append((n.name, text))
+                self.assertTrue(self.answer())
+                self.assertEqual(self.calls, ["Other", ("Other option", "Pick your recommended option(s)."), "Submit"])
+
+    def test_multiple_choice_ticks_each_recommendation_then_next(self):
+        claude_question(self.pane, ("Siła (Recommended)", "Masa", "Wytrzymałość (Recommended)"),
+                        multi=True, primary="Next")
+        self.ui.click = self.toggles
+        self.assertTrue(self.answer())
+        self.assertEqual(self.calls, ["Siła (Recommended)", "Wytrzymałość (Recommended)", "Next"])
+
+    def test_started_answers_are_left_alone(self):
+        claude_question(self.pane, ("Serie z recepty (Recommended)", "Wszystkie serie na górze"), answered=True)
+        self.ui.click = self.calls.append
+        with self.assertRaisesRegex(RuntimeError, "already has a selected answer"):
+            self.answer()
+        self.pane = pane("Onboarding i wskaźniki ćwiczeń")
+        group = claude_question(self.pane, ("Siła (Recommended)", "Masa"), multi=True)
+        group.children[3].control.GetTogglePattern().ToggleState = 1
+        with self.assertRaisesRegex(RuntimeError, "already has a selected answer"):
+            self.answer()
+        self.assertEqual(self.calls, [])
+
+    def test_question_card_with_next_button_is_found(self):
+        claude_question(self.pane, ("Siła (Recommended)", "Masa"), primary="Next")
+        found = question_in(self.pane)
+        self.assertEqual(found["submit"].name, "Next")
+        self.assertEqual([label for label in found["labels"]], ["Siła (Recommended)", "Masa", "Other"])
+        self.assertEqual(len(found["recommended"]), 1)
+
+    def test_answer_that_failed_before_any_click_is_tried_again(self):
+        engine = SessionEngine(self.worker, self.ui, quota=FakeQuota())
+        self.worker.cfg.update(auto_approach=True, auto_send=True)
+        claude_question(self.pane, ("Serie z recepty (Recommended)", "Wszystkie serie na górze"))
+        asked = observed(question=question_in(self.pane))
+        state, attempts = SessionState(), []
+
+        def not_foreground(key, fingerprint):
+            attempts.append(fingerprint)
+            raise RuntimeError("Claude is not foreground")
+        self.ui.answer = not_foreground
+        for _ in range(2):
+            with self.assertRaises(RuntimeError):
+                engine.step(self.pane.key, state, asked, NOW)
+        self.assertEqual(len(attempts), 2)
+
+        def clicked_then_failed(key, fingerprint):
+            attempts.append(fingerprint)
+            self.ui.clicks += 1
+            raise RuntimeError("Recommended selections could not be verified")
+        self.ui.answer = clicked_then_failed
+        for _ in range(2):
+            try:
+                engine.step(self.pane.key, state, asked, NOW)
+            except RuntimeError:
+                pass
+        self.assertEqual(len(attempts), 3)      # an uncertain click is never repeated
+
+
 class FakeQuota:
     def __init__(self, reset=None):
         self.reset = reset
